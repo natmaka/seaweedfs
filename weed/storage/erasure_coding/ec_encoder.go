@@ -79,7 +79,7 @@ func generateEcFiles(baseFileName string, bufferSize int, largeBlockSize int64, 
 	}
 
 	glog.V(0).Infof("encodeDatFile %s.dat size:%d", baseFileName, fi.Size())
-	err = encodeDatFile(fi.Size(), err, baseFileName, bufferSize, largeBlockSize, file, smallBlockSize)
+	err = encodeDatFile(fi.Size(), baseFileName, bufferSize, largeBlockSize, file, smallBlockSize)
 	if err != nil {
 		return fmt.Errorf("encodeDatFile: %v", err)
 	}
@@ -120,6 +120,10 @@ func generateMissingEcFiles(baseFileName string, bufferSize int, largeBlockSize 
 func encodeData(file *os.File, enc reedsolomon.Encoder, startOffset, blockSize int64, buffers [][]byte, outputs []*os.File) error {
 
 	bufferSize := int64(len(buffers[0]))
+	if bufferSize == 0 {
+		glog.Fatal("unexpected zero buffer size")
+	}
+
 	batchCount := blockSize / bufferSize
 	if blockSize%bufferSize != 0 {
 		glog.Fatalf("unexpected block size %d buffer size %d", blockSize, bufferSize)
@@ -191,7 +195,7 @@ func encodeDataOneBatch(file *os.File, enc reedsolomon.Encoder, startOffset, blo
 	return nil
 }
 
-func encodeDatFile(remainingSize int64, err error, baseFileName string, bufferSize int, largeBlockSize int64, file *os.File, smallBlockSize int64) error {
+func encodeDatFile(remainingSize int64, baseFileName string, bufferSize int, largeBlockSize int64, file *os.File, smallBlockSize int64) error {
 
 	var processedSize int64
 
