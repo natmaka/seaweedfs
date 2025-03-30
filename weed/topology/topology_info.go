@@ -2,7 +2,7 @@ package topology
 
 import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
-	"golang.org/x/exp/slices"
+	"slices"
 	"strings"
 )
 
@@ -11,6 +11,11 @@ type TopologyInfo struct {
 	Free        int64              `json:"Free"`
 	DataCenters []DataCenterInfo   `json:"DataCenters"`
 	Layouts     []VolumeLayoutInfo `json:"Layouts"`
+}
+
+type VolumeLayoutCollection struct {
+	Collection   string
+	VolumeLayout *VolumeLayout
 }
 
 func (t *Topology) ToInfo() (info TopologyInfo) {
@@ -40,6 +45,17 @@ func (t *Topology) ToInfo() (info TopologyInfo) {
 	}
 	info.Layouts = layouts
 	return
+}
+
+func (t *Topology) ListVolumeLayoutCollections() (volumeLayouts []*VolumeLayoutCollection) {
+	for _, col := range t.collectionMap.Items() {
+		for _, volumeLayout := range col.(*Collection).storageType2VolumeLayout.Items() {
+			volumeLayouts = append(volumeLayouts,
+				&VolumeLayoutCollection{col.(*Collection).Name, volumeLayout.(*VolumeLayout)},
+			)
+		}
+	}
+	return volumeLayouts
 }
 
 func (t *Topology) ToVolumeMap() interface{} {
@@ -80,6 +96,7 @@ func (t *Topology) ToVolumeLocations() (volumeLocations []*master_pb.VolumeLocat
 					Url:        dn.Url(),
 					PublicUrl:  dn.PublicUrl,
 					DataCenter: dn.GetDataCenterId(),
+					GrpcPort:   uint32(dn.GrpcPort),
 				}
 				for _, v := range dn.GetVolumes() {
 					volumeLocation.NewVids = append(volumeLocation.NewVids, uint32(v.Id))

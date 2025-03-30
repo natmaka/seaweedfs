@@ -1,10 +1,13 @@
 package broker
 
 import (
-	"fmt"
+	"context"
+	"github.com/seaweedfs/seaweedfs/weed/filer_client"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
-	"github.com/seaweedfs/seaweedfs/weed/mq/balancer"
+	"github.com/seaweedfs/seaweedfs/weed/mq/pub_balancer"
+	"github.com/seaweedfs/seaweedfs/weed/mq/sub_coordinator"
 	"github.com/seaweedfs/seaweedfs/weed/mq/topic"
+	"sync"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
@@ -27,6 +30,11 @@ type MessageQueueBrokerOption struct {
 	Ip                 string
 	Port               int
 	Cipher             bool
+	VolumeServerAccess string // how to access volume servers
+}
+
+func (option *MessageQueueBrokerOption) BrokerAddress() pb.ServerAddress {
+	return pb.NewServerAddress(option.Ip, option.Port, 0)
 }
 
 type MessageQueueBroker struct {
@@ -37,26 +45,40 @@ type MessageQueueBroker struct {
 	filers            map[pb.ServerAddress]struct{}
 	currentFiler      pb.ServerAddress
 	localTopicManager *topic.LocalTopicManager
-	Balancer          *balancer.Balancer
+	PubBalancer       *pub_balancer.PubBalancer
 	lockAsBalancer    *cluster.LiveLock
-	currentBalancer   pb.ServerAddress
+	SubCoordinator    *sub_coordinator.SubCoordinator
+	accessLock        sync.Mutex
+	fca               *filer_client.FilerClientAccessor
 }
 
 func NewMessageBroker(option *MessageQueueBrokerOption, grpcDialOption grpc.DialOption) (mqBroker *MessageQueueBroker, err error) {
 
+	pubBalancer := pub_balancer.NewPubBalancer()
+	subCoordinator := sub_coordinator.NewSubCoordinator()
+
 	mqBroker = &MessageQueueBroker{
 		option:            option,
 		grpcDialOption:    grpcDialOption,
-		MasterClient:      wdclient.NewMasterClient(grpcDialOption, option.FilerGroup, cluster.BrokerType, pb.NewServerAddress(option.Ip, option.Port, 0), option.DataCenter, option.Rack, *pb.NewServiceDiscoveryFromMap(option.Masters)),
+		MasterClient:      wdclient.NewMasterClient(grpcDialOption, option.FilerGroup, cluster.BrokerType, option.BrokerAddress(), option.DataCenter, option.Rack, *pb.NewServiceDiscoveryFromMap(option.Masters)),
 		filers:            make(map[pb.ServerAddress]struct{}),
 		localTopicManager: topic.NewLocalTopicManager(),
-		Balancer:          balancer.NewBalancer(),
+		PubBalancer:       pubBalancer,
+		SubCoordinator:    subCoordinator,
 	}
+	fca := &filer_client.FilerClientAccessor{
+		GetFiler:          mqBroker.GetFiler,
+		GetGrpcDialOption: mqBroker.GetGrpcDialOption,
+	}
+	mqBroker.fca = fca
+	subCoordinator.FilerClientAccessor = fca
+
 	mqBroker.MasterClient.SetOnPeerUpdateFn(mqBroker.OnBrokerUpdate)
+	pubBalancer.OnPartitionChange = mqBroker.SubCoordinator.OnPartitionChange
 
-	go mqBroker.MasterClient.KeepConnectedToMaster()
+	go mqBroker.MasterClient.KeepConnectedToMaster(context.Background())
 
-	existingNodes := cluster.ListExistingPeerUpdates(mqBroker.MasterClient.GetMaster(), grpcDialOption, option.FilerGroup, cluster.FilerType)
+	existingNodes := cluster.ListExistingPeerUpdates(mqBroker.MasterClient.GetMaster(context.Background()), grpcDialOption, option.FilerGroup, cluster.FilerType)
 	for _, newNode := range existingNodes {
 		mqBroker.OnBrokerUpdate(newNode, time.Now())
 	}
@@ -66,39 +88,37 @@ func NewMessageBroker(option *MessageQueueBrokerOption, grpcDialOption grpc.Dial
 		for mqBroker.currentFiler == "" {
 			time.Sleep(time.Millisecond * 237)
 		}
-		self := fmt.Sprintf("%s:%d", option.Ip, option.Port)
-		glog.V(1).Infof("broker %s found filer %s", self, mqBroker.currentFiler)
+		self := option.BrokerAddress()
+		glog.V(0).Infof("broker %s found filer %s", self, mqBroker.currentFiler)
 
+		newBrokerBalancerCh := make(chan string, 1)
 		lockClient := cluster.NewLockClient(grpcDialOption, mqBroker.currentFiler)
-		mqBroker.lockAsBalancer = lockClient.StartLock(balancer.LockBrokerBalancer, self)
-		for {
-			err := mqBroker.BrokerConnectToBalancer(self)
-			if err != nil {
-				fmt.Printf("BrokerConnectToBalancer: %v\n", err)
-			}
-			time.Sleep(time.Second)
-		}
+		mqBroker.lockAsBalancer = lockClient.StartLongLivedLock(pub_balancer.LockBrokerBalancer, string(self), func(newLockOwner string) {
+			glog.V(0).Infof("broker %s found balanacer %s", self, newLockOwner)
+			newBrokerBalancerCh <- newLockOwner
+		})
+		mqBroker.KeepConnectedToBrokerBalancer(newBrokerBalancerCh)
 	}()
 
 	return mqBroker, nil
 }
 
-func (broker *MessageQueueBroker) OnBrokerUpdate(update *master_pb.ClusterNodeUpdate, startFrom time.Time) {
+func (b *MessageQueueBroker) OnBrokerUpdate(update *master_pb.ClusterNodeUpdate, startFrom time.Time) {
 	if update.NodeType != cluster.FilerType {
 		return
 	}
 
 	address := pb.ServerAddress(update.Address)
 	if update.IsAdd {
-		broker.filers[address] = struct{}{}
-		if broker.currentFiler == "" {
-			broker.currentFiler = address
+		b.filers[address] = struct{}{}
+		if b.currentFiler == "" {
+			b.currentFiler = address
 		}
 	} else {
-		delete(broker.filers, address)
-		if broker.currentFiler == address {
-			for filer := range broker.filers {
-				broker.currentFiler = filer
+		delete(b.filers, address)
+		if b.currentFiler == address {
+			for filer := range b.filers {
+				b.currentFiler = filer
 				break
 			}
 		}
@@ -106,39 +126,43 @@ func (broker *MessageQueueBroker) OnBrokerUpdate(update *master_pb.ClusterNodeUp
 
 }
 
-func (broker *MessageQueueBroker) GetFiler() pb.ServerAddress {
-	return broker.currentFiler
+func (b *MessageQueueBroker) GetGrpcDialOption() grpc.DialOption {
+	return b.grpcDialOption
 }
 
-func (broker *MessageQueueBroker) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
+func (b *MessageQueueBroker) GetFiler() pb.ServerAddress {
+	return b.currentFiler
+}
 
-	return pb.WithFilerClient(streamingMode, 0, broker.GetFiler(), broker.grpcDialOption, fn)
+func (b *MessageQueueBroker) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
+
+	return pb.WithFilerClient(streamingMode, 0, b.GetFiler(), b.grpcDialOption, fn)
 
 }
 
-func (broker *MessageQueueBroker) AdjustedUrl(location *filer_pb.Location) string {
+func (b *MessageQueueBroker) AdjustedUrl(location *filer_pb.Location) string {
 
 	return location.Url
 
 }
 
-func (broker *MessageQueueBroker) GetDataCenter() string {
+func (b *MessageQueueBroker) GetDataCenter() string {
 
 	return ""
 
 }
 
-func (broker *MessageQueueBroker) withMasterClient(streamingMode bool, master pb.ServerAddress, fn func(client master_pb.SeaweedClient) error) error {
+func (b *MessageQueueBroker) withMasterClient(streamingMode bool, master pb.ServerAddress, fn func(client master_pb.SeaweedClient) error) error {
 
-	return pb.WithMasterClient(streamingMode, master, broker.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
+	return pb.WithMasterClient(streamingMode, master, b.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
 		return fn(client)
 	})
 
 }
 
-func (broker *MessageQueueBroker) withBrokerClient(streamingMode bool, server pb.ServerAddress, fn func(client mq_pb.SeaweedMessagingClient) error) error {
+func (b *MessageQueueBroker) withBrokerClient(streamingMode bool, server pb.ServerAddress, fn func(client mq_pb.SeaweedMessagingClient) error) error {
 
-	return pb.WithBrokerGrpcClient(streamingMode, server.String(), broker.grpcDialOption, func(client mq_pb.SeaweedMessagingClient) error {
+	return pb.WithBrokerGrpcClient(streamingMode, server.String(), b.grpcDialOption, func(client mq_pb.SeaweedMessagingClient) error {
 		return fn(client)
 	})
 

@@ -164,7 +164,7 @@ func (vs *VolumeServer) VolumeMarkReadonly(ctx context.Context, req *volume_serv
 	// rare case 1.5: it will be unlucky if heartbeat happened between step 1 and 2.
 
 	// step 2: mark local volume as readonly
-	err := vs.store.MarkVolumeReadonly(needle.VolumeId(req.VolumeId))
+	err := vs.store.MarkVolumeReadonly(needle.VolumeId(req.VolumeId), req.GetPersist())
 
 	if err != nil {
 		glog.Errorf("volume mark readonly %v: %v", req, err)
@@ -181,7 +181,7 @@ func (vs *VolumeServer) VolumeMarkReadonly(ctx context.Context, req *volume_serv
 }
 
 func (vs *VolumeServer) notifyMasterVolumeReadonly(v *storage.Volume, isReadOnly bool) error {
-	if grpcErr := pb.WithMasterClient(false, vs.GetMaster(), vs.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
+	if grpcErr := pb.WithMasterClient(false, vs.GetMaster(context.Background()), vs.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
 		_, err := client.VolumeMarkReadonly(context.Background(), &master_pb.VolumeMarkReadonlyRequest{
 			Ip:               vs.store.Ip,
 			Port:             uint32(vs.store.Port),
@@ -197,8 +197,8 @@ func (vs *VolumeServer) notifyMasterVolumeReadonly(v *storage.Volume, isReadOnly
 		}
 		return nil
 	}); grpcErr != nil {
-		glog.V(0).Infof("connect to %s: %v", vs.GetMaster(), grpcErr)
-		return fmt.Errorf("grpc VolumeMarkReadonly with master %s: %v", vs.GetMaster(), grpcErr)
+		glog.V(0).Infof("connect to %s: %v", vs.GetMaster(context.Background()), grpcErr)
+		return fmt.Errorf("grpc VolumeMarkReadonly with master %s: %v", vs.GetMaster(context.Background()), grpcErr)
 	}
 	return nil
 }
@@ -235,6 +235,9 @@ func (vs *VolumeServer) VolumeStatus(ctx context.Context, req *volume_server_pb.
 	v := vs.store.GetVolume(needle.VolumeId(req.VolumeId))
 	if v == nil {
 		return nil, fmt.Errorf("not found volume id %d", req.VolumeId)
+	}
+	if v.DataBackend == nil {
+		return nil, fmt.Errorf("volume %d data backend not found", req.VolumeId)
 	}
 
 	volumeSize, _, _ := v.DataBackend.GetStat()

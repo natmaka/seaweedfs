@@ -23,6 +23,7 @@ var (
 
 type WebDavOption struct {
 	filer          *string
+	ipBind         *string
 	filerRootPath  *string
 	port           *int
 	collection     *string
@@ -32,11 +33,13 @@ type WebDavOption struct {
 	tlsCertificate *string
 	cacheDir       *string
 	cacheSizeMB    *int64
+	maxMB          *int
 }
 
 func init() {
 	cmdWebDav.Run = runWebDav // break init cycle
 	webDavStandaloneOptions.filer = cmdWebDav.Flag.String("filer", "localhost:8888", "filer server address")
+	webDavStandaloneOptions.ipBind = cmdWebDav.Flag.String("ip.bind", "", "ip address to bind to. Default listen to all.")
 	webDavStandaloneOptions.port = cmdWebDav.Flag.Int("port", 7333, "webdav server http listen port")
 	webDavStandaloneOptions.collection = cmdWebDav.Flag.String("collection", "", "collection to create the files")
 	webDavStandaloneOptions.replication = cmdWebDav.Flag.String("replication", "", "replication to create the files")
@@ -45,6 +48,7 @@ func init() {
 	webDavStandaloneOptions.tlsCertificate = cmdWebDav.Flag.String("cert.file", "", "path to the TLS certificate file")
 	webDavStandaloneOptions.cacheDir = cmdWebDav.Flag.String("cacheDir", os.TempDir(), "local cache directory for file chunks")
 	webDavStandaloneOptions.cacheSizeMB = cmdWebDav.Flag.Int64("cacheCapacityMB", 0, "local cache capacity in MB")
+	webDavStandaloneOptions.maxMB = cmdWebDav.Flag.Int("maxMB", 4, "split files larger than the limit")
 	webDavStandaloneOptions.filerRootPath = cmdWebDav.Flag.String("filer.path", "/", "use this remote path from filer server")
 }
 
@@ -58,9 +62,10 @@ var cmdWebDav = &Command{
 
 func runWebDav(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 
-	glog.V(0).Infof("Starting Seaweed WebDav Server %s at https port %d", util.Version(), *webDavStandaloneOptions.port)
+	listenAddress := fmt.Sprintf("%s:%d", *webDavStandaloneOptions.ipBind, *webDavStandaloneOptions.port)
+	glog.V(0).Infof("Starting Seaweed WebDav Server %s at %s", util.Version(), listenAddress)
 
 	return webDavStandaloneOptions.startWebDav()
 
@@ -116,6 +121,7 @@ func (wo *WebDavOption) startWebDav() bool {
 		Cipher:         cipher,
 		CacheDir:       util.ResolvePath(*wo.cacheDir),
 		CacheSizeMB:    *wo.cacheSizeMB,
+		MaxMB:          *wo.maxMB,
 	})
 	if webdavServer_err != nil {
 		glog.Fatalf("WebDav Server startup error: %v", webdavServer_err)
@@ -123,19 +129,19 @@ func (wo *WebDavOption) startWebDav() bool {
 
 	httpS := &http.Server{Handler: ws.Handler}
 
-	listenAddress := fmt.Sprintf(":%d", *wo.port)
+	listenAddress := fmt.Sprintf("%s:%d", *wo.ipBind, *wo.port)
 	webDavListener, err := util.NewListener(listenAddress, time.Duration(10)*time.Second)
 	if err != nil {
 		glog.Fatalf("WebDav Server listener on %s error: %v", listenAddress, err)
 	}
 
 	if *wo.tlsPrivateKey != "" {
-		glog.V(0).Infof("Start Seaweed WebDav Server %s at https port %d", util.Version(), *wo.port)
+		glog.V(0).Infof("Start Seaweed WebDav Server %s at https %s", util.Version(), listenAddress)
 		if err = httpS.ServeTLS(webDavListener, *wo.tlsCertificate, *wo.tlsPrivateKey); err != nil {
 			glog.Fatalf("WebDav Server Fail to serve: %v", err)
 		}
 	} else {
-		glog.V(0).Infof("Start Seaweed WebDav Server %s at http port %d", util.Version(), *wo.port)
+		glog.V(0).Infof("Start Seaweed WebDav Server %s at http %s", util.Version(), listenAddress)
 		if err = httpS.Serve(webDavListener); err != nil {
 			glog.Fatalf("WebDav Server Fail to serve: %v", err)
 		}

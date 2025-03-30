@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
-	"math/rand"
+	"github.com/seaweedfs/seaweedfs/weed/server/constants"
+	"math/rand/v2"
+	"reflect"
 	"sync"
 	"time"
 
@@ -15,7 +17,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
-	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 /*
@@ -28,9 +29,32 @@ This package is created to resolve these replica placement issues:
 
 type VolumeGrowRequest struct {
 	Option *VolumeGrowOption
-	Count  int
-	ErrCh  chan error
+	Count  uint32
+	Force  bool
+	Reason string
 }
+
+func (vg *VolumeGrowRequest) Equals(req *VolumeGrowRequest) bool {
+	return reflect.DeepEqual(vg.Option, req.Option) && vg.Count == req.Count && vg.Force == req.Force
+}
+
+type volumeGrowthStrategy struct {
+	Copy1Count     uint32
+	Copy2Count     uint32
+	Copy3Count     uint32
+	CopyOtherCount uint32
+	Threshold      float64
+}
+
+var (
+	VolumeGrowStrategy = volumeGrowthStrategy{
+		Copy1Count:     7,
+		Copy2Count:     6,
+		Copy3Count:     3,
+		CopyOtherCount: 1,
+		Threshold:      0.9,
+	}
+)
 
 type VolumeGrowOption struct {
 	Collection         string                        `json:"collection,omitempty"`
@@ -53,33 +77,27 @@ func (o *VolumeGrowOption) String() string {
 	return string(blob)
 }
 
-func (o *VolumeGrowOption) Threshold() float64 {
-	v := util.GetViper()
-	return v.GetFloat64("master.volume_growth.threshold")
-}
-
 func NewDefaultVolumeGrowth() *VolumeGrowth {
 	return &VolumeGrowth{}
 }
 
 // one replication type may need rp.GetCopyCount() actual volumes
 // given copyCount, how many logical volumes to create
-func (vg *VolumeGrowth) findVolumeCount(copyCount int) (count int) {
-	v := util.GetViper()
+func (vg *VolumeGrowth) findVolumeCount(copyCount int) (count uint32) {
 	switch copyCount {
 	case 1:
-		count = v.GetInt("master.volume_growth.copy_1")
+		count = VolumeGrowStrategy.Copy1Count
 	case 2:
-		count = v.GetInt("master.volume_growth.copy_2")
+		count = VolumeGrowStrategy.Copy2Count
 	case 3:
-		count = v.GetInt("master.volume_growth.copy_3")
+		count = VolumeGrowStrategy.Copy3Count
 	default:
-		count = v.GetInt("master.volume_growth.copy_other")
+		count = VolumeGrowStrategy.CopyOtherCount
 	}
 	return
 }
 
-func (vg *VolumeGrowth) AutomaticGrowByType(option *VolumeGrowOption, grpcDialOption grpc.DialOption, topo *Topology, targetCount int) (result []*master_pb.VolumeLocation, err error) {
+func (vg *VolumeGrowth) AutomaticGrowByType(option *VolumeGrowOption, grpcDialOption grpc.DialOption, topo *Topology, targetCount uint32) (result []*master_pb.VolumeLocation, err error) {
 	if targetCount == 0 {
 		targetCount = vg.findVolumeCount(option.ReplicaPlacement.GetCopyCount())
 	}
@@ -89,11 +107,11 @@ func (vg *VolumeGrowth) AutomaticGrowByType(option *VolumeGrowOption, grpcDialOp
 	}
 	return result, err
 }
-func (vg *VolumeGrowth) GrowByCountAndType(grpcDialOption grpc.DialOption, targetCount int, option *VolumeGrowOption, topo *Topology) (result []*master_pb.VolumeLocation, err error) {
+func (vg *VolumeGrowth) GrowByCountAndType(grpcDialOption grpc.DialOption, targetCount uint32, option *VolumeGrowOption, topo *Topology) (result []*master_pb.VolumeLocation, err error) {
 	vg.accessLock.Lock()
 	defer vg.accessLock.Unlock()
 
-	for i := 0; i < targetCount; i++ {
+	for i := uint32(0); i < targetCount; i++ {
 		if res, e := vg.findAndGrow(grpcDialOption, topo, option); e == nil {
 			result = append(result, res...)
 		} else {
@@ -109,6 +127,10 @@ func (vg *VolumeGrowth) findAndGrow(grpcDialOption grpc.DialOption, topo *Topolo
 	if e != nil {
 		return nil, e
 	}
+	for !topo.LastLeaderChangeTime.Add(constants.VolumePulseSeconds * 2).Before(time.Now()) {
+		glog.V(0).Infof("wait for volume servers to join back")
+		time.Sleep(constants.VolumePulseSeconds / 2)
+	}
 	vid, raftErr := topo.NextVolumeId()
 	if raftErr != nil {
 		return nil, raftErr
@@ -119,6 +141,7 @@ func (vg *VolumeGrowth) findAndGrow(grpcDialOption grpc.DialOption, topo *Topolo
 				Url:        server.Url(),
 				PublicUrl:  server.PublicUrl,
 				DataCenter: server.GetDataCenterId(),
+				GrpcPort:   uint32(server.GrpcPort),
 				NewVids:    []uint32{uint32(vid)},
 			})
 		}
@@ -211,7 +234,7 @@ func (vg *VolumeGrowth) findEmptySlotsForOneVolume(topo *Topology, option *Volum
 		servers = append(servers, server.(*DataNode))
 	}
 	for _, rack := range otherRacks {
-		r := rand.Int63n(rack.AvailableSpaceFor(option))
+		r := rand.Int64N(rack.AvailableSpaceFor(option))
 		if server, e := rack.ReserveOneVolume(r, option); e == nil {
 			servers = append(servers, server)
 		} else {
@@ -219,7 +242,7 @@ func (vg *VolumeGrowth) findEmptySlotsForOneVolume(topo *Topology, option *Volum
 		}
 	}
 	for _, datacenter := range otherDataCenters {
-		r := rand.Int63n(datacenter.AvailableSpaceFor(option))
+		r := rand.Int64N(datacenter.AvailableSpaceFor(option))
 		if server, e := datacenter.ReserveOneVolume(r, option); e == nil {
 			servers = append(servers, server)
 		} else {

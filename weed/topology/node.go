@@ -2,7 +2,7 @@ package topology
 
 import (
 	"errors"
-	"math/rand"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,7 +21,7 @@ type Node interface {
 	String() string
 	AvailableSpaceFor(option *VolumeGrowOption) int64
 	ReserveOneVolume(r int64, option *VolumeGrowOption) (*DataNode, error)
-	UpAdjustDiskUsageDelta(deltaDiskUsages *DiskUsages)
+	UpAdjustDiskUsageDelta(diskType types.DiskType, diskUsage *DiskUsageCounts)
 	UpAdjustMaxVolumeId(vid needle.VolumeId)
 	GetDiskUsages() *DiskUsages
 
@@ -83,7 +83,7 @@ func (n *NodeImpl) PickNodesByWeight(numberOfNodes int, option *VolumeGrowOption
 	//pick nodes randomly by weights, the node picked earlier has higher final weights
 	sortedCandidates := make([]Node, 0, len(candidates))
 	for i := 0; i < len(candidates); i++ {
-		weightsInterval := rand.Int63n(totalWeights)
+		weightsInterval := rand.Int64N(totalWeights)
 		lastWeights := int64(0)
 		for k, weights := range candidatesWeights {
 			if (weightsInterval >= lastWeights) && (weightsInterval < lastWeights+weights) {
@@ -214,13 +214,11 @@ func (n *NodeImpl) ReserveOneVolume(r int64, option *VolumeGrowOption) (assigned
 	return nil, errors.New("No free volume slot found!")
 }
 
-func (n *NodeImpl) UpAdjustDiskUsageDelta(deltaDiskUsages *DiskUsages) { //can be negative
-	for diskType, diskUsage := range deltaDiskUsages.usages {
-		existingDisk := n.getOrCreateDisk(diskType)
-		existingDisk.addDiskUsageCounts(diskUsage)
-	}
+func (n *NodeImpl) UpAdjustDiskUsageDelta(diskType types.DiskType, diskUsage *DiskUsageCounts) { //can be negative
+	existingDisk := n.getOrCreateDisk(diskType)
+	existingDisk.addDiskUsageCounts(diskUsage)
 	if n.parent != nil {
-		n.parent.UpAdjustDiskUsageDelta(deltaDiskUsages)
+		n.parent.UpAdjustDiskUsageDelta(diskType, diskUsage)
 	}
 }
 func (n *NodeImpl) UpAdjustMaxVolumeId(vid needle.VolumeId) { //can be negative
@@ -244,7 +242,9 @@ func (n *NodeImpl) LinkChildNode(node Node) {
 func (n *NodeImpl) doLinkChildNode(node Node) {
 	if n.children[node.Id()] == nil {
 		n.children[node.Id()] = node
-		n.UpAdjustDiskUsageDelta(node.GetDiskUsages())
+		for dt, du := range node.GetDiskUsages().usages {
+			n.UpAdjustDiskUsageDelta(dt, du)
+		}
 		n.UpAdjustMaxVolumeId(node.GetMaxVolumeId())
 		node.SetParent(n)
 		glog.V(0).Infoln(n, "adds child", node.Id())
@@ -258,12 +258,14 @@ func (n *NodeImpl) UnlinkChildNode(nodeId NodeId) {
 	if node != nil {
 		node.SetParent(nil)
 		delete(n.children, node.Id())
-		n.UpAdjustDiskUsageDelta(node.GetDiskUsages().negative())
+		for dt, du := range node.GetDiskUsages().negative().usages {
+			n.UpAdjustDiskUsageDelta(dt, du)
+		}
 		glog.V(0).Infoln(n, "removes", node.Id())
 	}
 }
 
-func (n *NodeImpl) CollectDeadNodeAndFullVolumes(freshThreshHold int64, volumeSizeLimit uint64, growThreshold float64) {
+func (n *NodeImpl) CollectDeadNodeAndFullVolumes(freshThreshHoldUnixTime int64, volumeSizeLimit uint64, growThreshold float64) {
 	if n.IsRack() {
 		for _, c := range n.Children() {
 			dn := c.(*DataNode) //can not cast n to DataNode
@@ -299,7 +301,7 @@ func (n *NodeImpl) CollectDeadNodeAndFullVolumes(freshThreshHold int64, volumeSi
 		}
 	} else {
 		for _, c := range n.Children() {
-			c.CollectDeadNodeAndFullVolumes(freshThreshHold, volumeSizeLimit, growThreshold)
+			c.CollectDeadNodeAndFullVolumes(freshThreshHoldUnixTime, volumeSizeLimit, growThreshold)
 		}
 	}
 }

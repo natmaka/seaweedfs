@@ -2,6 +2,7 @@ package cassandra
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/gocql/gocql"
 	"time"
@@ -129,13 +130,10 @@ func (store *CassandraStore) FindEntry(ctx context.Context, fullpath util.FullPa
 	if err := store.session.Query(
 		"SELECT meta FROM filemeta WHERE directory=? AND name=?",
 		dir, name).Scan(&data); err != nil {
-		if err != gocql.ErrNotFound {
+		if errors.Is(err, gocql.ErrNotFound) {
 			return nil, filer_pb.ErrNotFound
 		}
-	}
-
-	if len(data) == 0 {
-		return nil, filer_pb.ErrNotFound
+		return nil, err
 	}
 
 	entry = &filer.Entry{
@@ -211,7 +209,7 @@ func (store *CassandraStore) ListDirectoryEntries(ctx context.Context, dirPath u
 			break
 		}
 	}
-	if err := iter.Close(); err != nil {
+	if err = iter.Close(); err != nil {
 		glog.V(0).Infof("list iterator close: %v", err)
 	}
 

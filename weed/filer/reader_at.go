@@ -97,6 +97,10 @@ func NewChunkReaderAtFromClient(readerCache *ReaderCache, chunkViews *IntervalLi
 	}
 }
 
+func (c *ChunkReadAt) Size() int64 {
+	return c.fileSize
+}
+
 func (c *ChunkReadAt) Close() error {
 	c.readerCache.destroy()
 	return nil
@@ -169,15 +173,14 @@ func (c *ChunkReadAt) doReadAt(p []byte, offset int64) (n int, ts int64, err err
 	// zero the remaining bytes if a gap exists at the end of the last chunk (or a fully sparse file)
 	if err == nil && remaining > 0 {
 		var delta int64
-		if c.fileSize > startOffset {
+		if c.fileSize >= startOffset {
 			delta = min(remaining, c.fileSize-startOffset)
 			startOffset -= offset
-		} else {
-			delta = remaining
-			startOffset = max(startOffset-offset, startOffset-remaining-offset)
 		}
-		glog.V(4).Infof("zero2 [%d,%d) of file size %d bytes", startOffset, startOffset+delta, c.fileSize)
-		n += zero(p, startOffset, delta)
+		if delta > 0 {
+			glog.V(4).Infof("zero2 [%d,%d) of file size %d bytes", startOffset, startOffset+delta, c.fileSize)
+			n += zero(p, startOffset, delta)
+		}
 	}
 
 	if err == nil && offset+int64(len(p)) >= c.fileSize {
@@ -199,7 +202,8 @@ func (c *ChunkReadAt) readChunkSliceAt(buffer []byte, chunkView *ChunkView, next
 		return fetchChunkRange(buffer, c.readerCache.lookupFileIdFn, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset))
 	}
 
-	n, err = c.readerCache.ReadChunkAt(buffer, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset), int(chunkView.ChunkSize), chunkView.ViewOffset == 0)
+	shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= c.readerCache.chunkCache.GetMaxFilePartSizeInCache()
+	n, err = c.readerCache.ReadChunkAt(buffer, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int64(offset), int(chunkView.ChunkSize), shouldCache)
 	if c.lastChunkFid != chunkView.FileId {
 		if chunkView.OffsetInChunk == 0 { // start of a new chunk
 			if c.lastChunkFid != "" {
@@ -215,6 +219,9 @@ func (c *ChunkReadAt) readChunkSliceAt(buffer []byte, chunkView *ChunkView, next
 }
 
 func zero(buffer []byte, start, length int64) int {
+	if length <= 0 {
+		return 0
+	}
 	end := min(start+length, int64(len(buffer)))
 	start = max(start, 0)
 

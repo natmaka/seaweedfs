@@ -10,8 +10,8 @@ const (
 	ErrorSizeMismatch           = "errorSizeMismatch"
 	ErrorCRC                    = "errorCRC"
 	ErrorIndexOutOfRange        = "errorIndexOutOfRange"
-	ErrorGetNotFound 						= "errorGetNotFound"
-	ErrorGetInternal 						= "errorGetInternal"	
+	ErrorGetNotFound            = "errorGetNotFound"
+	ErrorGetInternal            = "errorGetInternal"
 
 	// master topology
 	ErrorWriteToLocalDisk = "errorWriteToLocalDisk"
@@ -27,12 +27,14 @@ const (
 	Failed                = "failed"
 
 	// filer handler
-	DirList                  = "dirList"
-	ContentSaveToFiler       = "contentSaveToFiler"
-	AutoChunk                = "autoChunk"
-	ChunkProxy               = "chunkProxy"
-	ChunkAssign              = "chunkAssign"
-	ChunkUpload              = "chunkUpload"
+	DirList            = "dirList"
+	ContentSaveToFiler = "contentSaveToFiler"
+	AutoChunk          = "autoChunk"
+	ChunkProxy         = "chunkProxy"
+	ChunkAssign        = "chunkAssign"
+	ChunkUpload        = "chunkUpload"
+	ChunkMerge         = "chunkMerge"
+
 	ChunkDoUploadRetry       = "chunkDoUploadRetry"
 	ChunkUploadRetry         = "chunkUploadRetry"
 	ChunkAssignRetry         = "chunkAssignRetry"
@@ -40,6 +42,18 @@ const (
 	ErrorReadInternal        = "read.internal.error"
 	ErrorWriteEntry          = "write.entry.failed"
 	RepeatErrorUploadContent = "upload.content.repeat.failed"
+	ErrorChunkAssign         = "chunkAssign.failed"
+	ErrorReadChunk           = "read.chunk.failed"
 	ErrorReadCache           = "read.cache.failed"
 	ErrorReadStream          = "read.stream.failed"
+
+	// s3 handler
+	ErrorCompletedNoSuchUpload      = "errorCompletedNoSuchUpload"
+	ErrorCompleteEntityTooSmall     = "errorCompleteEntityTooSmall"
+	ErrorCompletedPartEmpty         = "errorCompletedPartEmpty"
+	ErrorCompletedPartNumber        = "errorCompletedPartNumber"
+	ErrorCompletedPartNotFound      = "errorCompletedPartNotFound"
+	ErrorCompletedEtagInvalid       = "errorCompletedEtagInvalid"
+	ErrorCompletedEtagMismatch      = "errorCompletedEtagMismatch"
+	ErrorCompletedPartEntryMismatch = "errorCompletedPartEntryMismatch"
 )

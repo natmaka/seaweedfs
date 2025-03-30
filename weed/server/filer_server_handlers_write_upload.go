@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/exp/slices"
+	"slices"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
@@ -27,7 +27,7 @@ var bufPool = sync.Pool{
 	},
 }
 
-func (fs *FilerServer) uploadReaderToChunks(w http.ResponseWriter, r *http.Request, reader io.Reader, chunkSize int32, fileName, contentType string, contentLength int64, so *operation.StorageOption) (fileChunks []*filer_pb.FileChunk, md5Hash hash.Hash, chunkOffset int64, uploadErr error, smallContent []byte) {
+func (fs *FilerServer) uploadRequestToChunks(w http.ResponseWriter, r *http.Request, reader io.Reader, chunkSize int32, fileName, contentType string, contentLength int64, so *operation.StorageOption) (fileChunks []*filer_pb.FileChunk, md5Hash hash.Hash, chunkOffset int64, uploadErr error, smallContent []byte) {
 	query := r.URL.Query()
 
 	isAppend := isAppend(r)
@@ -45,7 +45,13 @@ func (fs *FilerServer) uploadReaderToChunks(w http.ResponseWriter, r *http.Reque
 		chunkOffset = offsetInt
 	}
 
+	return fs.uploadReaderToChunks(reader, chunkOffset, chunkSize, fileName, contentType, isAppend, so)
+}
+
+func (fs *FilerServer) uploadReaderToChunks(reader io.Reader, startOffset int64, chunkSize int32, fileName, contentType string, isAppend bool, so *operation.StorageOption) (fileChunks []*filer_pb.FileChunk, md5Hash hash.Hash, chunkOffset int64, uploadErr error, smallContent []byte) {
+
 	md5Hash = md5.New()
+	chunkOffset = startOffset
 	var partReader = io.NopCloser(io.TeeReader(reader, md5Hash))
 
 	var wg sync.WaitGroup
@@ -57,6 +63,16 @@ func (fs *FilerServer) uploadReaderToChunks(w http.ResponseWriter, r *http.Reque
 
 		// need to throttle used byte buffer
 		bytesBufferLimitChan <- struct{}{}
+
+		// As long as there is an error in the upload of one chunk, it can be terminated early
+		// uploadErr may be modified in other go routines, lock is needed to avoid race condition
+		uploadErrLock.Lock()
+		if uploadErr != nil {
+			<-bytesBufferLimitChan
+			uploadErrLock.Unlock()
+			break
+		}
+		uploadErrLock.Unlock()
 
 		bytesBuffer := bufPool.Get().(*bytes.Buffer)
 
@@ -86,22 +102,22 @@ func (fs *FilerServer) uploadReaderToChunks(w http.ResponseWriter, r *http.Reque
 				bytesBuffer.Read(smallContent)
 				bufPool.Put(bytesBuffer)
 				<-bytesBufferLimitChan
-				stats.FilerRequestCounter.WithLabelValues(stats.ContentSaveToFiler).Inc()
+				stats.FilerHandlerCounter.WithLabelValues(stats.ContentSaveToFiler).Inc()
 				break
 			}
 		} else {
-			stats.FilerRequestCounter.WithLabelValues(stats.AutoChunk).Inc()
+			stats.FilerHandlerCounter.WithLabelValues(stats.AutoChunk).Inc()
 		}
 
 		wg.Add(1)
-		go func(offset int64) {
+		go func(offset int64, buf *bytes.Buffer) {
 			defer func() {
-				bufPool.Put(bytesBuffer)
+				bufPool.Put(buf)
 				<-bytesBufferLimitChan
 				wg.Done()
 			}()
 
-			chunks, toChunkErr := fs.dataToChunk(fileName, contentType, bytesBuffer.Bytes(), offset, so)
+			chunks, toChunkErr := fs.dataToChunk(fileName, contentType, buf.Bytes(), offset, so)
 			if toChunkErr != nil {
 				uploadErrLock.Lock()
 				if uploadErr == nil {
@@ -118,7 +134,7 @@ func (fs *FilerServer) uploadReaderToChunks(w http.ResponseWriter, r *http.Reque
 				}
 				fileChunksLock.Unlock()
 			}
-		}(chunkOffset)
+		}(chunkOffset, bytesBuffer)
 
 		// reset variables for the next chunk
 		chunkOffset = chunkOffset + dataSize
@@ -132,7 +148,11 @@ func (fs *FilerServer) uploadReaderToChunks(w http.ResponseWriter, r *http.Reque
 	wg.Wait()
 
 	if uploadErr != nil {
-		fs.filer.DeleteChunks(fileChunks)
+		glog.V(0).Infof("upload file %s error: %v", fileName, uploadErr)
+		for _, chunk := range fileChunks {
+			glog.V(4).Infof("purging failed uploaded %s chunk %s [%d,%d)", fileName, chunk.FileId, chunk.Offset, chunk.Offset+int64(chunk.Size))
+		}
+		fs.filer.DeleteUncommittedChunks(fileChunks)
 		return nil, md5Hash, 0, uploadErr, nil
 	}
 	slices.SortFunc(fileChunks, func(a, b *filer_pb.FileChunk) int {
@@ -143,7 +163,7 @@ func (fs *FilerServer) uploadReaderToChunks(w http.ResponseWriter, r *http.Reque
 
 func (fs *FilerServer) doUpload(urlLocation string, limitedReader io.Reader, fileName string, contentType string, pairMap map[string]string, auth security.EncodedJwt) (*operation.UploadResult, error, []byte) {
 
-	stats.FilerRequestCounter.WithLabelValues(stats.ChunkUpload).Inc()
+	stats.FilerHandlerCounter.WithLabelValues(stats.ChunkUpload).Inc()
 	start := time.Now()
 	defer func() {
 		stats.FilerRequestHistogram.WithLabelValues(stats.ChunkUpload).Observe(time.Since(start).Seconds())
@@ -158,9 +178,15 @@ func (fs *FilerServer) doUpload(urlLocation string, limitedReader io.Reader, fil
 		PairMap:           pairMap,
 		Jwt:               auth,
 	}
-	uploadResult, err, data := operation.Upload(limitedReader, uploadOption)
+
+	uploader, err := operation.NewUploader()
+	if err != nil {
+		return nil, err, []byte{}
+	}
+
+	uploadResult, err, data := uploader.Upload(limitedReader, uploadOption)
 	if uploadResult != nil && uploadResult.RetryCount > 0 {
-		stats.FilerRequestCounter.WithLabelValues(stats.ChunkUploadRetry).Add(float64(uploadResult.RetryCount))
+		stats.FilerHandlerCounter.WithLabelValues(stats.ChunkUploadRetry).Add(float64(uploadResult.RetryCount))
 	}
 	return uploadResult, err, data
 }
@@ -180,14 +206,14 @@ func (fs *FilerServer) dataToChunk(fileName, contentType string, data []byte, ch
 		fileId, urlLocation, auth, uploadErr = fs.assignNewFileInfo(so)
 		if uploadErr != nil {
 			glog.V(4).Infof("retry later due to assign error: %v", uploadErr)
-			stats.FilerRequestCounter.WithLabelValues(stats.ChunkAssignRetry).Inc()
+			stats.FilerHandlerCounter.WithLabelValues(stats.ChunkAssignRetry).Inc()
 			return uploadErr
 		}
 		// upload the chunk to the volume server
 		uploadResult, uploadErr, _ = fs.doUpload(urlLocation, dataReader, fileName, contentType, nil, auth)
 		if uploadErr != nil {
 			glog.V(4).Infof("retry later due to upload error: %v", uploadErr)
-			stats.FilerRequestCounter.WithLabelValues(stats.ChunkDoUploadRetry).Inc()
+			stats.FilerHandlerCounter.WithLabelValues(stats.ChunkDoUploadRetry).Inc()
 			fid, _ := filer_pb.ToFileIdObject(fileId)
 			fileChunk := filer_pb.FileChunk{
 				FileId: fileId,

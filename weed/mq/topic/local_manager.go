@@ -3,6 +3,7 @@ package topic
 import (
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/schema_pb"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"time"
 )
@@ -19,26 +20,20 @@ func NewLocalTopicManager() *LocalTopicManager {
 	}
 }
 
-// AddTopicPartition adds a topic to the local topic manager
-func (manager *LocalTopicManager) AddTopicPartition(topic Topic, localPartition *LocalPartition) {
+// AddLocalPartition adds a topic to the local topic manager
+func (manager *LocalTopicManager) AddLocalPartition(topic Topic, localPartition *LocalPartition) {
 	localTopic, ok := manager.topics.Get(topic.String())
 	if !ok {
-		localTopic = &LocalTopic{
-			Topic:      topic,
-			Partitions: make([]*LocalPartition, 0),
-		}
+		localTopic = NewLocalTopic(topic)
 	}
 	if !manager.topics.SetIfAbsent(topic.String(), localTopic) {
 		localTopic, _ = manager.topics.Get(topic.String())
 	}
-	if localTopic.findPartition(localPartition.Partition) != nil {
-		return
-	}
-	localTopic.Partitions = append(localTopic.Partitions, localPartition)
+	localTopic.addPartition(localPartition)
 }
 
-// GetTopic gets a topic from the local topic manager
-func (manager *LocalTopicManager) GetTopicPartition(topic Topic, partition Partition) *LocalPartition {
+// GetLocalPartition gets a topic from the local topic manager
+func (manager *LocalTopicManager) GetLocalPartition(topic Topic, partition Partition) *LocalPartition {
 	localTopic, ok := manager.topics.Get(topic.String())
 	if !ok {
 		return nil
@@ -51,12 +46,28 @@ func (manager *LocalTopicManager) RemoveTopic(topic Topic) {
 	manager.topics.Remove(topic.String())
 }
 
-func (manager *LocalTopicManager) RemoveTopicPartition(topic Topic, partition Partition) (removed bool) {
+func (manager *LocalTopicManager) RemoveLocalPartition(topic Topic, partition Partition) (removed bool) {
 	localTopic, ok := manager.topics.Get(topic.String())
 	if !ok {
 		return false
 	}
 	return localTopic.removePartition(partition)
+}
+
+func (manager *LocalTopicManager) ClosePublishers(topic Topic, unixTsNs int64) (removed bool) {
+	localTopic, ok := manager.topics.Get(topic.String())
+	if !ok {
+		return false
+	}
+	return localTopic.closePartitionPublishers(unixTsNs)
+}
+
+func (manager *LocalTopicManager) CloseSubscribers(topic Topic, unixTsNs int64) (removed bool) {
+	localTopic, ok := manager.topics.Get(topic.String())
+	if !ok {
+		return false
+	}
+	return localTopic.closePartitionSubscribers(unixTsNs)
 }
 
 func (manager *LocalTopicManager) CollectStats(duration time.Duration) *mq_pb.BrokerStats {
@@ -75,24 +86,18 @@ func (manager *LocalTopicManager) CollectStats(duration time.Duration) *mq_pb.Br
 	manager.topics.IterCb(func(topic string, localTopic *LocalTopic) {
 		for _, localPartition := range localTopic.Partitions {
 			topicPartition := &TopicPartition{
-				Topic: Topic{Namespace: localTopic.Namespace, Name: localTopic.Name},
-				Partition: Partition{
-					RingSize:   localPartition.RingSize,
-					RangeStart: localPartition.RangeStart,
-					RangeStop:  localPartition.RangeStop,
-				},
+				Topic:     Topic{Namespace: localTopic.Namespace, Name: localTopic.Name},
+				Partition: localPartition.Partition,
 			}
-			stats.Stats[topicPartition.String()] = &mq_pb.TopicPartitionStats{
-				Topic: &mq_pb.Topic{
+			stats.Stats[topicPartition.TopicPartitionId()] = &mq_pb.TopicPartitionStats{
+				Topic: &schema_pb.Topic{
 					Namespace: string(localTopic.Namespace),
 					Name:      localTopic.Name,
 				},
-				Partition: &mq_pb.Partition{
-					RingSize:   localPartition.RingSize,
-					RangeStart: localPartition.RangeStart,
-					RangeStop:  localPartition.RangeStop,
-				},
-				ConsumerCount: localPartition.ConsumerCount,
+				Partition:       localPartition.Partition.ToPbPartition(),
+				PublisherCount:  int32(localPartition.Publishers.Size()),
+				SubscriberCount: int32(localPartition.Subscribers.Size()),
+				Follower:        localPartition.Follower,
 			}
 			// fmt.Printf("collect topic %+v partition %+v\n", topicPartition, localPartition.Partition)
 		}
@@ -100,4 +105,12 @@ func (manager *LocalTopicManager) CollectStats(duration time.Duration) *mq_pb.Br
 
 	return stats
 
+}
+
+func (manager *LocalTopicManager) WaitUntilNoPublishers(topic Topic) {
+	localTopic, ok := manager.topics.Get(topic.String())
+	if !ok {
+		return
+	}
+	localTopic.WaitUntilNoPublishers()
 }

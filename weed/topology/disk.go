@@ -2,10 +2,11 @@ package topology
 
 import (
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/storage/types"
-	"github.com/seaweedfs/seaweedfs/weed/util"
 	"sync"
 	"sync/atomic"
+
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
@@ -65,7 +66,7 @@ func (d *DiskUsages) ToDiskInfo() map[string]*master_pb.DiskInfo {
 		m := &master_pb.DiskInfo{
 			VolumeCount:       diskUsageCounts.volumeCount,
 			MaxVolumeCount:    diskUsageCounts.maxVolumeCount,
-			FreeVolumeCount:   diskUsageCounts.maxVolumeCount - diskUsageCounts.volumeCount,
+			FreeVolumeCount:   diskUsageCounts.maxVolumeCount - (diskUsageCounts.volumeCount - diskUsageCounts.remoteVolumeCount) - (diskUsageCounts.ecShardCount+1)/erasure_coding.DataShardsCount,
 			ActiveVolumeCount: diskUsageCounts.activeVolumeCount,
 			RemoteVolumeCount: diskUsageCounts.remoteVolumeCount,
 		}
@@ -151,8 +152,7 @@ func (d *Disk) AddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChanged bool) {
 }
 
 func (d *Disk) doAddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChanged bool) {
-	deltaDiskUsages := newDiskUsages()
-	deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(types.ToDiskType(v.DiskType))
+	deltaDiskUsage := &DiskUsageCounts{}
 	if oldV, ok := d.volumes[v.Id]; !ok {
 		d.volumes[v.Id] = v
 		deltaDiskUsage.volumeCount = 1
@@ -163,7 +163,7 @@ func (d *Disk) doAddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChanged bool)
 			deltaDiskUsage.activeVolumeCount = 1
 		}
 		d.UpAdjustMaxVolumeId(v.Id)
-		d.UpAdjustDiskUsageDelta(deltaDiskUsages)
+		d.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), deltaDiskUsage)
 		isNew = true
 	} else {
 		if oldV.IsRemote() != v.IsRemote() {
@@ -173,7 +173,7 @@ func (d *Disk) doAddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChanged bool)
 			if oldV.IsRemote() {
 				deltaDiskUsage.remoteVolumeCount = -1
 			}
-			d.UpAdjustDiskUsageDelta(deltaDiskUsages)
+			d.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), deltaDiskUsage)
 		}
 		isChanged = d.volumes[v.Id].ReadOnly != v.ReadOnly
 		d.volumes[v.Id] = v
@@ -199,6 +199,12 @@ func (d *Disk) GetVolumesById(id needle.VolumeId) (storage.VolumeInfo, error) {
 	} else {
 		return storage.VolumeInfo{}, fmt.Errorf("volumeInfo not found")
 	}
+}
+
+func (d *Disk) DeleteVolumeById(id needle.VolumeId) {
+	d.Lock()
+	defer d.Unlock()
+	delete(d.volumes, id)
 }
 
 func (d *Disk) GetDataCenter() *DataCenter {
@@ -244,7 +250,7 @@ func (d *Disk) ToDiskInfo() *master_pb.DiskInfo {
 		Type:              string(d.Id()),
 		VolumeCount:       diskUsage.volumeCount,
 		MaxVolumeCount:    diskUsage.maxVolumeCount,
-		FreeVolumeCount:   diskUsage.maxVolumeCount - diskUsage.volumeCount,
+		FreeVolumeCount:   diskUsage.maxVolumeCount - (diskUsage.volumeCount - diskUsage.remoteVolumeCount) - (diskUsage.ecShardCount+1)/erasure_coding.DataShardsCount,
 		ActiveVolumeCount: diskUsage.activeVolumeCount,
 		RemoteVolumeCount: diskUsage.remoteVolumeCount,
 	}

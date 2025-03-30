@@ -63,7 +63,9 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 		if req.DiskType != "" {
 			diskType = req.DiskType
 		}
-		location := vs.store.FindFreeLocation(types.ToDiskType(diskType))
+		location := vs.store.FindFreeLocation(func(location *storage.DiskLocation) bool {
+			return location.DiskType == types.ToDiskType(diskType)
+		})
 		if location == nil {
 			return fmt.Errorf("no space left for disk type %s", types.ToDiskType(diskType).ReadableString())
 		}
@@ -84,17 +86,17 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 		}()
 
 		var preallocateSize int64
-		if grpcErr := pb.WithMasterClient(false, vs.GetMaster(), vs.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
+		if grpcErr := pb.WithMasterClient(false, vs.GetMaster(context.Background()), vs.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
 			resp, err := client.GetMasterConfiguration(context.Background(), &master_pb.GetMasterConfigurationRequest{})
 			if err != nil {
-				return fmt.Errorf("get master %s configuration: %v", vs.GetMaster(), err)
+				return fmt.Errorf("get master %s configuration: %v", vs.GetMaster(context.Background()), err)
 			}
 			if resp.VolumePreallocate {
 				preallocateSize = int64(resp.VolumeSizeLimitMB) * (1 << 20)
 			}
 			return nil
 		}); grpcErr != nil {
-			glog.V(0).Infof("connect to %s: %v", vs.GetMaster(), grpcErr)
+			glog.V(0).Infof("connect to %s: %v", vs.GetMaster(context.Background()), grpcErr)
 		}
 
 		if preallocateSize > 0 && !hasRemoteDatFile {
@@ -226,7 +228,7 @@ func (vs *VolumeServer) doCopyFileWithThrottler(client volume_server_pb.VolumeSe
 
 /*
 *
-only check the the differ of the file size
+only check the differ of the file size
 todo: maybe should check the received count and deleted count of the volume
 */
 func checkCopyFiles(originFileInf *volume_server_pb.ReadVolumeFileStatusResponse, hasRemoteDatFile bool, idxFileName, datFileName string) error {

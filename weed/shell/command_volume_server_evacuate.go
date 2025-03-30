@@ -3,14 +3,15 @@ package shell
 import (
 	"flag"
 	"fmt"
+	"io"
+	"os"
+
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
-	"golang.org/x/exp/slices"
-	"io"
-	"os"
+	"slices"
 )
 
 func init() {
@@ -43,6 +44,10 @@ func (c *commandVolumeServerEvacuate) Help() string {
 	You can use "-skipNonMoveable" to move the rest volumes.
 
 `
+}
+
+func (c *commandVolumeServerEvacuate) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandVolumeServerEvacuate) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -105,7 +110,7 @@ func (c *commandVolumeServerEvacuate) volumeServerEvacuate(commandEnv *CommandEn
 
 func (c *commandVolumeServerEvacuate) evacuateNormalVolumes(commandEnv *CommandEnv, volumeServer string, skipNonMoveable, applyChange bool, writer io.Writer) error {
 	// find this volume server
-	volumeServers := collectVolumeServersByDc(c.topologyInfo, "")
+	volumeServers := collectVolumeServersByDcRackNode(c.topologyInfo, "", "", "")
 	thisNodes, otherNodes := c.nodesOtherThan(volumeServers, volumeServer)
 	if len(thisNodes) == 0 {
 		return fmt.Errorf("%s is not found in this cluster", volumeServer)
@@ -119,7 +124,7 @@ func (c *commandVolumeServerEvacuate) evacuateNormalVolumes(commandEnv *CommandE
 					fmt.Fprintf(writer, "update topologyInfo %v", err)
 				} else {
 					_, otherNodesNew := c.nodesOtherThan(
-						collectVolumeServersByDc(topologyInfo, ""), volumeServer)
+						collectVolumeServersByDcRackNode(topologyInfo, "", "", ""), volumeServer)
 					if len(otherNodesNew) > 0 {
 						otherNodes = otherNodesNew
 						c.topologyInfo = topologyInfo
@@ -219,7 +224,7 @@ func moveAwayOneNormalVolume(commandEnv *CommandEnv, volumeReplicas map[uint32][
 	})
 	for i := 0; i < len(otherNodes); i++ {
 		emptyNode := otherNodes[i]
-		if freeVolumeCountfn(emptyNode.info) < 0 {
+		if freeVolumeCountfn(emptyNode.info) <= 0 {
 			continue
 		}
 		hasMoved, err = maybeMoveOneVolume(commandEnv, volumeReplicas, thisNode, vol, emptyNode, applyChange)

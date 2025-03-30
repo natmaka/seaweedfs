@@ -69,7 +69,7 @@ public class SeaweedRead {
             if (locations == null || locations.getLocationsCount() == 0) {
                 LOG.error("failed to locate {}", chunkView.fileId);
                 volumeIdCache.clearLocations(volumeId);
-                return 0;
+                throw new IOException("failed to locate fileId " + chunkView.fileId);
             }
 
             int len = readChunkView(filerClient, startOffset, buf, chunkView, locations);
@@ -103,7 +103,7 @@ public class SeaweedRead {
             chunkCache.setChunk(chunkView.fileId, chunkData);
         }
 
-        int len = (int) chunkView.size;
+        int len = (int) chunkView.size - (int) (startOffset - chunkView.logicOffset);
         LOG.debug("readChunkView fid:{} chunkData.length:{} chunkView.offset:{} chunkView[{};{}) startOffset:{}",
                 chunkView.fileId, chunkData.length, chunkView.offset, chunkView.logicOffset, chunkView.logicOffset + chunkView.size, startOffset);
         buf.put(chunkData, (int) (startOffset - chunkView.logicOffset + chunkView.offset), len);

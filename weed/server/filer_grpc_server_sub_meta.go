@@ -1,10 +1,13 @@
 package weed_server
 
 import (
+	"errors"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 
 	"google.golang.org/protobuf/proto"
 
@@ -22,17 +25,23 @@ const (
 
 func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest, stream filer_pb.SeaweedFiler_SubscribeMetadataServer) error {
 
-	peerAddress := findClientAddress(stream.Context(), 0)
+	ctx := stream.Context()
+	peerAddress := findClientAddress(ctx, 0)
 
 	isReplacing, alreadyKnown, clientName := fs.addClient("", req.ClientName, peerAddress, req.ClientId, req.ClientEpoch)
 	if isReplacing {
 		fs.filer.MetaAggregator.ListenersCond.Broadcast() // nudges the subscribers that are waiting
 	} else if alreadyKnown {
+		fs.filer.MetaAggregator.ListenersCond.Broadcast() // nudges the subscribers that are waiting
 		return fmt.Errorf("duplicated subscription detected for client %s id %d", clientName, req.ClientId)
 	}
-	defer fs.deleteClient("", clientName, req.ClientId, req.ClientEpoch)
+	defer func() {
+		glog.V(0).Infof("disconnect %v subscriber %s clientId:%d", clientName, req.PathPrefix, req.ClientId)
+		fs.deleteClient("", clientName, req.ClientId, req.ClientEpoch)
+		fs.filer.MetaAggregator.ListenersCond.Broadcast() // nudges the subscribers that are waiting
+	}()
 
-	lastReadTime := time.Unix(0, req.SinceNs)
+	lastReadTime := log_buffer.NewMessagePosition(req.SinceNs, -2)
 	glog.V(0).Infof(" %v starts to subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
 
 	eachEventNotificationFn := fs.eachEventNotificationFn(req, stream, clientName)
@@ -56,27 +65,42 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 			return nil
 		}
 
+		glog.V(4).Infof("processed to %v: %v", clientName, processedTsNs)
 		if processedTsNs != 0 {
-			lastReadTime = time.Unix(0, processedTsNs)
+			lastReadTime = log_buffer.NewMessagePosition(processedTsNs, -2)
+		} else {
+			nextDayTs := util.GetNextDayTsNano(lastReadTime.UnixNano())
+			position := log_buffer.NewMessagePosition(nextDayTs, -2)
+			found, err := fs.filer.HasPersistedLogFiles(position)
+			if err != nil {
+				return fmt.Errorf("checking persisted log files: %v", err)
+			}
+			if found {
+				lastReadTime = position
+			}
 		}
 
 		glog.V(4).Infof("read in memory %v aggregated subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
 
 		lastReadTime, isDone, readInMemoryLogErr = fs.filer.MetaAggregator.MetaLogBuffer.LoopProcessLogData("aggMeta:"+clientName, lastReadTime, req.UntilNs, func() bool {
+			// Check if the client has disconnected by monitoring the context
+			select {
+			case <-ctx.Done():
+				return false
+			default:
+			}
+
 			fs.filer.MetaAggregator.ListenersLock.Lock()
 			fs.filer.MetaAggregator.ListenersCond.Wait()
 			fs.filer.MetaAggregator.ListenersLock.Unlock()
-			if !fs.hasClient(req.ClientId, req.ClientEpoch) {
-				return false
-			}
-			return true
+			return fs.hasClient(req.ClientId, req.ClientEpoch)
 		}, eachLogEntryFn)
 		if readInMemoryLogErr != nil {
-			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
+			if errors.Is(readInMemoryLogErr, log_buffer.ResumeFromDiskError) {
 				continue
 			}
 			glog.Errorf("processed to %v: %v", lastReadTime, readInMemoryLogErr)
-			if readInMemoryLogErr != log_buffer.ResumeError {
+			if !errors.Is(readInMemoryLogErr, log_buffer.ResumeError) {
 				break
 			}
 		}
@@ -97,7 +121,8 @@ func (fs *FilerServer) SubscribeMetadata(req *filer_pb.SubscribeMetadataRequest,
 
 func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataRequest, stream filer_pb.SeaweedFiler_SubscribeLocalMetadataServer) error {
 
-	peerAddress := findClientAddress(stream.Context(), 0)
+	ctx := stream.Context()
+	peerAddress := findClientAddress(ctx, 0)
 
 	// use negative client id to differentiate from addClient()/deleteClient() used in SubscribeMetadata()
 	req.ClientId = -req.ClientId
@@ -111,9 +136,10 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 	defer func() {
 		glog.V(0).Infof("disconnect %v local subscriber %s clientId:%d", clientName, req.PathPrefix, req.ClientId)
 		fs.deleteClient("local", clientName, req.ClientId, req.ClientEpoch)
+		fs.listenersCond.Broadcast() // nudges the subscribers that are waiting
 	}()
 
-	lastReadTime := time.Unix(0, req.SinceNs)
+	lastReadTime := log_buffer.NewMessagePosition(req.SinceNs, -2)
 	glog.V(0).Infof(" + %v local subscribe %s from %+v clientId:%d", clientName, req.PathPrefix, lastReadTime, req.ClientId)
 
 	eachEventNotificationFn := fs.eachEventNotificationFn(req, stream, clientName)
@@ -138,7 +164,7 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 		}
 
 		if processedTsNs != 0 {
-			lastReadTime = time.Unix(0, processedTsNs)
+			lastReadTime = log_buffer.NewMessagePosition(processedTsNs, -2)
 		} else {
 			if readInMemoryLogErr == log_buffer.ResumeFromDiskError {
 				time.Sleep(1127 * time.Millisecond)
@@ -149,8 +175,18 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 		glog.V(0).Infof("read in memory %v local subscribe %s from %+v", clientName, req.PathPrefix, lastReadTime)
 
 		lastReadTime, isDone, readInMemoryLogErr = fs.filer.LocalMetaLogBuffer.LoopProcessLogData("localMeta:"+clientName, lastReadTime, req.UntilNs, func() bool {
+
+			// Check if the client has disconnected by monitoring the context
+			select {
+			case <-ctx.Done():
+				return false
+			default:
+			}
+
 			fs.listenersLock.Lock()
+			atomic.AddInt64(&fs.listenersWaits, 1)
 			fs.listenersCond.Wait()
+			atomic.AddInt64(&fs.listenersWaits, -1)
 			fs.listenersLock.Unlock()
 			if !fs.hasClient(req.ClientId, req.ClientEpoch) {
 				return false
@@ -178,19 +214,19 @@ func (fs *FilerServer) SubscribeLocalMetadata(req *filer_pb.SubscribeMetadataReq
 
 }
 
-func eachLogEntryFn(eachEventNotificationFn func(dirPath string, eventNotification *filer_pb.EventNotification, tsNs int64) error) func(logEntry *filer_pb.LogEntry) error {
-	return func(logEntry *filer_pb.LogEntry) error {
+func eachLogEntryFn(eachEventNotificationFn func(dirPath string, eventNotification *filer_pb.EventNotification, tsNs int64) error) log_buffer.EachLogEntryFuncType {
+	return func(logEntry *filer_pb.LogEntry) (bool, error) {
 		event := &filer_pb.SubscribeMetadataResponse{}
 		if err := proto.Unmarshal(logEntry.Data, event); err != nil {
 			glog.Errorf("unexpected unmarshal filer_pb.SubscribeMetadataResponse: %v", err)
-			return fmt.Errorf("unexpected unmarshal filer_pb.SubscribeMetadataResponse: %v", err)
+			return false, fmt.Errorf("unexpected unmarshal filer_pb.SubscribeMetadataResponse: %v", err)
 		}
 
 		if err := eachEventNotificationFn(event.Directory, event.EventNotification, event.TsNs); err != nil {
-			return err
+			return false, err
 		}
 
-		return nil
+		return false, nil
 	}
 }
 

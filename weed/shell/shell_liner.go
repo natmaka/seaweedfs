@@ -5,16 +5,15 @@ import (
 	"fmt"
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
-	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
-	"golang.org/x/exp/slices"
 	"io"
 	"math/rand"
 	"os"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/peterh/liner"
@@ -47,8 +46,9 @@ func RunShell(options ShellOptions) {
 
 	commandEnv := NewCommandEnv(&options)
 
-	go commandEnv.MasterClient.KeepConnectedToMaster()
-	commandEnv.MasterClient.WaitUntilConnected()
+	ctx := context.Background()
+	go commandEnv.MasterClient.KeepConnectedToMaster(ctx)
+	commandEnv.MasterClient.WaitUntilConnected(ctx)
 
 	if commandEnv.option.FilerAddress == "" {
 		var filers []pb.ServerAddress
@@ -72,24 +72,6 @@ func RunShell(options ShellOptions) {
 			commandEnv.option.FilerAddress = filers[rand.Intn(len(filers))]
 		}
 		fmt.Println()
-	}
-
-	if commandEnv.option.FilerAddress != "" {
-		commandEnv.WithFilerClient(false, func(filerClient filer_pb.SeaweedFilerClient) error {
-			resp, err := filerClient.GetFilerConfiguration(context.Background(), &filer_pb.GetFilerConfigurationRequest{})
-			if err != nil {
-				return err
-			}
-			if resp.ClusterId != "" {
-				fmt.Printf(`
----
-Free Monitoring Data URL:
-https://cloud.seaweedfs.com/ui/%s
----
-`, resp.ClusterId)
-			}
-			return nil
-		})
 	}
 
 	for {
@@ -170,8 +152,9 @@ func printHelp(cmds []string) {
 		cmd := strings.ToLower(args[0])
 
 		for _, c := range Commands {
-			if c.Name() == cmd {
+			if strings.ToLower(c.Name()) == cmd {
 				fmt.Printf("  %s\t# %s\n", c.Name(), c.Help())
+				fmt.Printf("use \"%s -h\" for more details\n", c.Name())
 			}
 		}
 	}

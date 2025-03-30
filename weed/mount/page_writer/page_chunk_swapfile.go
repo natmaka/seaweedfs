@@ -4,6 +4,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/mem"
+	"io"
 	"os"
 	"sync"
 )
@@ -129,15 +130,18 @@ func (sc *SwapFileChunk) ReadDataAt(p []byte, off int64, tsNs int64) (maxStop in
 		logicStart := max(off, chunkStartOffset+t.StartOffset)
 		logicStop := min(off+int64(len(p)), chunkStartOffset+t.stopOffset)
 		if logicStart < logicStop {
-			if t.TsNs >= tsNs {
-				actualStart := logicStart - chunkStartOffset + int64(sc.actualChunkIndex)*sc.swapfile.chunkSize
-				if _, err := sc.swapfile.file.ReadAt(p[logicStart-off:logicStop-off], actualStart); err != nil {
-					glog.Errorf("failed to reading swap file %s: %v", sc.swapfile.file.Name(), err)
-					break
+			actualStart := logicStart - chunkStartOffset + int64(sc.actualChunkIndex)*sc.swapfile.chunkSize
+			if n, err := sc.swapfile.file.ReadAt(p[logicStart-off:logicStop-off], actualStart); err != nil {
+				if err == io.EOF && n == int(logicStop-logicStart) {
+					err = nil
 				}
-				maxStop = max(maxStop, logicStop)
-			} else {
-				println("read old data2", tsNs-t.TsNs, "ns")
+				glog.Errorf("failed to reading swap file %s: %v", sc.swapfile.file.Name(), err)
+				break
+			}
+			maxStop = max(maxStop, logicStop)
+
+			if t.TsNs >= tsNs {
+				println("read new data2", t.TsNs-tsNs, "ns")
 			}
 		}
 	}

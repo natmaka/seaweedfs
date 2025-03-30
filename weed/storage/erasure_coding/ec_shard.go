@@ -2,6 +2,7 @@ package erasure_coding
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"strconv"
@@ -44,7 +45,7 @@ func NewEcVolumeShard(diskType types.DiskType, dirname string, collection string
 	}
 	v.ecdFileSize = ecdFi.Size()
 
-	stats.VolumeServerVolumeCounter.WithLabelValues(v.Collection, "ec_shards").Inc()
+	stats.VolumeServerVolumeGauge.WithLabelValues(v.Collection, "ec_shards").Inc()
 
 	return
 }
@@ -88,11 +89,15 @@ func (shard *EcVolumeShard) Close() {
 
 func (shard *EcVolumeShard) Destroy() {
 	os.Remove(shard.FileName() + ToExt(int(shard.ShardId)))
-	stats.VolumeServerVolumeCounter.WithLabelValues(shard.Collection, "ec_shards").Dec()
+	stats.VolumeServerVolumeGauge.WithLabelValues(shard.Collection, "ec_shards").Dec()
 }
 
 func (shard *EcVolumeShard) ReadAt(buf []byte, offset int64) (int, error) {
 
-	return shard.ecdFile.ReadAt(buf, offset)
+	n, err := shard.ecdFile.ReadAt(buf, offset)
+	if err == io.EOF && n == len(buf) {
+		err = nil
+	}
+	return n, err
 
 }

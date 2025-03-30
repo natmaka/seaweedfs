@@ -8,8 +8,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
-	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"io"
 	"net/http"
 	"net/url"
@@ -21,7 +19,11 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"github.com/stretchr/testify/assert"
 )
 
 // TestIsRequestPresignedSignatureV4 - Test validates the logic for presign signature version v4 detection.
@@ -43,7 +45,7 @@ func TestIsRequestPresignedSignatureV4(t *testing.T) {
 	for i, testCase := range testCases {
 		// creating an input HTTP request.
 		// Only the query parameters are relevant for this particular test.
-		inputReq, err := http.NewRequest("GET", "http://example.com", nil)
+		inputReq, err := http.NewRequest(http.MethodGet, "http://example.com", nil)
 		if err != nil {
 			t.Fatalf("Error initializing input HTTP request: %v", err)
 		}
@@ -85,9 +87,9 @@ func TestIsReqAuthenticated(t *testing.T) {
 		s3Error s3err.ErrorCode
 	}{
 		// When request is unsigned, access denied is returned.
-		{mustNewRequest("GET", "http://127.0.0.1:9000", 0, nil, t), s3err.ErrAccessDenied},
+		{mustNewRequest(http.MethodGet, "http://127.0.0.1:9000", 0, nil, t), s3err.ErrAccessDenied},
 		// When request is properly signed, error is none.
-		{mustNewSignedRequest("GET", "http://127.0.0.1:9000", 0, nil, t), s3err.ErrNone},
+		{mustNewSignedRequest(http.MethodGet, "http://127.0.0.1:9000", 0, nil, t), s3err.ErrNone},
 	}
 
 	// Validates all testcases.
@@ -117,8 +119,8 @@ func TestCheckaAnonymousRequestAuthType(t *testing.T) {
 		ErrCode s3err.ErrorCode
 		Action  Action
 	}{
-		{Request: mustNewRequest("GET", "http://127.0.0.1:9000/bucket", 0, nil, t), ErrCode: s3err.ErrNone, Action: s3_constants.ACTION_READ},
-		{Request: mustNewRequest("PUT", "http://127.0.0.1:9000/bucket", 0, nil, t), ErrCode: s3err.ErrAccessDenied, Action: s3_constants.ACTION_WRITE},
+		{Request: mustNewRequest(http.MethodGet, "http://127.0.0.1:9000/bucket", 0, nil, t), ErrCode: s3err.ErrNone, Action: s3_constants.ACTION_READ},
+		{Request: mustNewRequest(http.MethodPut, "http://127.0.0.1:9000/bucket", 0, nil, t), ErrCode: s3err.ErrAccessDenied, Action: s3_constants.ACTION_WRITE},
 	}
 	for i, testCase := range testCases {
 		_, s3Error := iam.authRequest(testCase.Request, testCase.Action)
@@ -155,9 +157,9 @@ func TestCheckAdminRequestAuthType(t *testing.T) {
 		Request *http.Request
 		ErrCode s3err.ErrorCode
 	}{
-		{Request: mustNewRequest("GET", "http://127.0.0.1:9000", 0, nil, t), ErrCode: s3err.ErrAccessDenied},
-		{Request: mustNewSignedRequest("GET", "http://127.0.0.1:9000", 0, nil, t), ErrCode: s3err.ErrNone},
-		{Request: mustNewPresignedRequest(iam, "GET", "http://127.0.0.1:9000", 0, nil, t), ErrCode: s3err.ErrNone},
+		{Request: mustNewRequest(http.MethodGet, "http://127.0.0.1:9000", 0, nil, t), ErrCode: s3err.ErrAccessDenied},
+		{Request: mustNewSignedRequest(http.MethodGet, "http://127.0.0.1:9000", 0, nil, t), ErrCode: s3err.ErrNone},
+		{Request: mustNewPresignedRequest(iam, http.MethodGet, "http://127.0.0.1:9000", 0, nil, t), ErrCode: s3err.ErrNone},
 	}
 	for i, testCase := range testCases {
 		if _, s3Error := iam.reqSignatureV4Verify(testCase.Request); s3Error != testCase.ErrCode {
@@ -214,7 +216,7 @@ func mustNewPresignedRequest(iam *IdentityAccessManagement, method string, urlSt
 // Returns new HTTP request object.
 func newTestRequest(method, urlStr string, contentLength int64, body io.ReadSeeker) (*http.Request, error) {
 	if method == "" {
-		method = "POST"
+		method = http.MethodPost
 	}
 
 	// Save for subsequent use
@@ -262,7 +264,7 @@ func getMD5HashBase64(data []byte) string {
 	return base64.StdEncoding.EncodeToString(getMD5Sum(data))
 }
 
-// getSHA256Hash returns SHA-256 sum of given data.
+// getSHA256Sum returns SHA-256 sum of given data.
 func getSHA256Sum(data []byte) []byte {
 	hash := sha256.New()
 	hash.Write(data)
@@ -286,6 +288,73 @@ var ignoredHeaders = map[string]bool{
 	"Content-Type":   true,
 	"Content-Length": true,
 	"User-Agent":     true,
+}
+
+// Tests the test helper with an example from the AWS Doc.
+// https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
+// This time it's a PUT request uploading the file with content "Welcome to Amazon S3."
+func TestGetStringToSignPUT(t *testing.T) {
+
+	canonicalRequest := `PUT
+/test%24file.text
+
+date:Fri, 24 May 2013 00:00:00 GMT
+host:examplebucket.s3.amazonaws.com
+x-amz-content-sha256:44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072
+x-amz-date:20130524T000000Z
+x-amz-storage-class:REDUCED_REDUNDANCY
+
+date;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class
+44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072`
+
+	date, err := time.Parse(iso8601Format, "20130524T000000Z")
+
+	if err != nil {
+		t.Fatalf("Error parsing date: %v", err)
+	}
+
+	scope := "20130524/us-east-1/s3/aws4_request"
+	stringToSign := getStringToSign(canonicalRequest, date, scope)
+
+	expected := `AWS4-HMAC-SHA256
+20130524T000000Z
+20130524/us-east-1/s3/aws4_request
+9e0e90d9c76de8fa5b200d8c849cd5b8dc7a3be3951ddb7f6a76b4158342019d`
+
+	assert.Equal(t, expected, stringToSign)
+}
+
+// Tests the test helper with an example from the AWS Doc.
+// https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
+// The GET request example with empty string hash.
+func TestGetStringToSignGETEmptyStringHash(t *testing.T) {
+
+	canonicalRequest := `GET
+/test.txt
+
+host:examplebucket.s3.amazonaws.com
+range:bytes=0-9
+x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+x-amz-date:20130524T000000Z
+
+host;range;x-amz-content-sha256;x-amz-date
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
+
+	date, err := time.Parse(iso8601Format, "20130524T000000Z")
+
+	if err != nil {
+		t.Fatalf("Error parsing date: %v", err)
+	}
+
+	scope := "20130524/us-east-1/s3/aws4_request"
+	stringToSign := getStringToSign(canonicalRequest, date, scope)
+
+	expected := `AWS4-HMAC-SHA256
+20130524T000000Z
+20130524/us-east-1/s3/aws4_request
+7344ae5b7ee6c3e7e6b0fe0640412a37625d1fbfff95c48bbb2dc43964946972`
+
+	assert.Equal(t, expected, stringToSign)
 }
 
 // Sign given request using Signature V4.

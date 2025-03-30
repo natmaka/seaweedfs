@@ -9,12 +9,15 @@ metadata:
     helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/instance: {{ .Release.Name }}
+{{- if .Values.s3.annotations }}
+  annotations:
+    {{- toYaml .Values.s3.annotations | nindent 4 }}
+{{- end }}
 spec:
   replicas: {{ .Values.s3.replicas }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ template "seaweedfs.name" . }}
-      helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
       app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/component: s3
   template:
@@ -27,8 +30,14 @@ spec:
       {{ with .Values.podLabels }}
       {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.s3.podLabels }}
+      {{- toYaml . | nindent 8 }}
+      {{- end }}
       annotations:
       {{ with .Values.podAnnotations }}
+      {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.s3.podAnnotations }}
       {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
@@ -50,6 +59,9 @@ spec:
       initContainers:
         {{ tpl .Values.s3.initContainers . | nindent 8 | trim }}
       {{- end }}
+      {{- if .Values.s3.podSecurityContext.enabled }}
+      securityContext: {{- omit .Values.s3.podSecurityContext "enabled" | toYaml | nindent 8 }}
+      {{- end }}
       containers:
         - name: seaweedfs
           image: {{ template "s3.image" . }}
@@ -69,18 +81,34 @@ spec:
                   fieldPath: metadata.namespace
             - name: SEAWEEDFS_FULLNAME
               value: "{{ template "seaweedfs.name" . }}"
+            {{- if .Values.s3.extraEnvironmentVars }}
+            {{- range $key, $value := .Values.s3.extraEnvironmentVars }}
+            - name: {{ $key }}
+            {{- if kindIs "string" $value }}
+              value: {{ $value | quote }}
+            {{- else }}
+              valueFrom:
+                {{ toYaml $value | nindent 16 | trim }}
+            {{- end -}}
+            {{- end }}
+            {{- end }}
             {{- if .Values.global.extraEnvironmentVars }}
             {{- range $key, $value := .Values.global.extraEnvironmentVars }}
             - name: {{ $key }}
+            {{- if kindIs "string" $value }}
               value: {{ $value | quote }}
+            {{- else }}
+              valueFrom:
+                {{ toYaml $value | nindent 16 | trim }}
+            {{- end -}}
             {{- end }}
             {{- end }}
           command:
             - "/bin/sh"
             - "-ec"
-            - | 
+            - |
               exec /usr/bin/weed \
-               {{- if eq .Values.s3.logs.type "hostPath" }}
+              {{- if or (eq .Values.s3.logs.type "hostPath") (eq .Values.s3.logs.type "emptyDir") }}
               -logdir=/logs \
               {{- else }}
               -logtostderr=true \
@@ -106,7 +134,7 @@ spec:
               {{- if .Values.s3.domainName }}
               -domainName={{ .Values.s3.domainName }} \
               {{- end }}
-              {{- if .Values.s3.allowEmptyFolder }}
+              {{- if eq (typeOf .Values.s3.allowEmptyFolder) "bool" }}
               -allowEmptyFolder={{ .Values.s3.allowEmptyFolder }} \
               {{- end }}
               {{- if .Values.s3.enableAuth }}
@@ -117,13 +145,15 @@ spec:
               {{- end }}
               -filer={{ template "seaweedfs.name" . }}-filer-client.{{ .Release.Namespace }}:{{ .Values.filer.port }}
           volumeMounts:
-            {{- if eq .Values.s3.logs.type "hostPath" }}
+            {{- if or (eq .Values.s3.logs.type "hostPath") (eq .Values.s3.logs.type "emptyDir") }}
             - name: logs
               mountPath: "/logs/"
             {{- end }}
+            {{- if .Values.s3.enableAuth }}
             - mountPath: /etc/sw
               name: config-users
               readOnly: true
+            {{- end }}
             {{- if .Values.global.enableSecurity }}
             - name: security-config
               readOnly: true
@@ -149,9 +179,13 @@ spec:
           ports:
             - containerPort: {{ .Values.s3.port }}
               name: swfs-s3
+            {{- if .Values.s3.httpsPort }}
+            - containerPort: {{ .Values.s3.httpsPort }}
+              name: swfs-s3-tls
+            {{- end }}
             {{- if .Values.s3.metricsPort }}
             - containerPort: {{ .Values.s3.metricsPort }}
-              name: "metrics"
+              name: metrics
             {{- end }}
           {{- if .Values.s3.readinessProbe.enabled }}
           readinessProbe:
@@ -177,20 +211,36 @@ spec:
             failureThreshold: {{ .Values.s3.livenessProbe.failureThreshold }}
             timeoutSeconds: {{ .Values.s3.livenessProbe.timeoutSeconds }}
           {{- end }}
-          {{- if .Values.s3.resources }}
+          {{- with .Values.s3.resources }}
           resources:
-            {{ tpl .Values.s3.resources . | nindent 12 | trim }}
+            {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- if .Values.s3.containerSecurityContext.enabled }}
+          securityContext: {{- omit .Values.s3.containerSecurityContext "enabled" | toYaml | nindent 12 }}
+          {{- end }}
+      {{- if .Values.s3.sidecars }}
+      {{- include "common.tplvalues.render" (dict "value" .Values.s3.sidecars "context" $) | nindent 8 }}
+      {{- end }}
       volumes:
+        {{- if .Values.s3.enableAuth }}
         - name: config-users
           secret:
             defaultMode: 420
+            {{- if .Values.s3.existingConfigSecret }}
+            secretName: {{ .Values.s3.existingConfigSecret }}
+            {{- else }}
             secretName: seaweedfs-s3-secret
+            {{- end }}
+        {{- end }}
         {{- if eq .Values.s3.logs.type "hostPath" }}
         - name: logs
           hostPath:
             path: {{ .Values.s3.logs.hostPathPrefix }}/logs/seaweedfs/s3
             type: DirectoryOrCreate
+        {{- end }}
+        {{- if eq .Values.s3.logs.type "emptyDir" }}
+        - name: logs
+          emptyDir: {}
         {{- end }}
         {{- if .Values.global.enableSecurity }}
         - name: security-config

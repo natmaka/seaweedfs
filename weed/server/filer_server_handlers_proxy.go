@@ -2,22 +2,32 @@ package weed_server
 
 import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
-	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 )
 
-var (
-	client *http.Client
-)
+func (fs *FilerServer) maybeAddVolumeJwtAuthorization(r *http.Request, fileId string, isWrite bool) {
+	encodedJwt := fs.maybeGetVolumeJwtAuthorizationToken(fileId, isWrite)
 
-func init() {
-	client = &http.Client{Transport: &http.Transport{
-		MaxIdleConns:        1024,
-		MaxIdleConnsPerHost: 1024,
-	}}
+	if encodedJwt == "" {
+		return
+	}
+
+	r.Header.Set("Authorization", "BEARER "+string(encodedJwt))
+}
+
+func (fs *FilerServer) maybeGetVolumeJwtAuthorizationToken(fileId string, isWrite bool) string {
+	var encodedJwt security.EncodedJwt
+	if isWrite {
+		encodedJwt = security.GenJwtForVolumeServer(fs.volumeGuard.SigningKey, fs.volumeGuard.ExpiresAfterSec, fileId)
+	} else {
+		encodedJwt = security.GenJwtForVolumeServer(fs.volumeGuard.ReadSigningKey, fs.volumeGuard.ReadExpiresAfterSec, fileId)
+	}
+	return string(encodedJwt)
 }
 
 func (fs *FilerServer) proxyToVolumeServer(w http.ResponseWriter, r *http.Request, fileId string) {
@@ -34,7 +44,7 @@ func (fs *FilerServer) proxyToVolumeServer(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	proxyReq, err := http.NewRequest(r.Method, urlStrings[rand.Intn(len(urlStrings))], r.Body)
+	proxyReq, err := http.NewRequest(r.Method, urlStrings[rand.IntN(len(urlStrings))], r.Body)
 	if err != nil {
 		glog.Errorf("NewRequest %s: %v", urlStrings[0], err)
 		w.WriteHeader(http.StatusInternalServerError)
@@ -50,14 +60,14 @@ func (fs *FilerServer) proxyToVolumeServer(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	proxyResponse, postErr := client.Do(proxyReq)
+	proxyResponse, postErr := util_http.GetGlobalHttpClient().Do(proxyReq)
 
 	if postErr != nil {
 		glog.Errorf("post to filer: %v", postErr)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	defer util.CloseResponse(proxyResponse)
+	defer util_http.CloseResponse(proxyResponse)
 
 	for k, v := range proxyResponse.Header {
 		w.Header()[k] = v

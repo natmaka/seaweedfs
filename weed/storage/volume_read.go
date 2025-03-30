@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
@@ -55,9 +56,6 @@ func (v *Volume) readNeedle(n *needle.Needle, readOption *ReadOption, onReadSize
 	}
 	if readOption == nil || !readOption.IsMetaOnly {
 		err = n.ReadData(v.DataBackend, nv.Offset.ToActualOffset(), readSize, v.Version())
-		if err == needle.ErrorSizeMismatch && OffsetSize == 4 {
-			err = n.ReadData(v.DataBackend, nv.Offset.ToActualOffset()+int64(MaxPossibleVolumeSize), readSize, v.Version())
-		}
 		v.checkReadWriteError(err)
 		if err != nil {
 			return 0, err
@@ -166,6 +164,16 @@ func (v *Volume) readNeedleDataInto(n *needle.Needle, readOption *ReadOption, wr
 		toWrite := min(count, int(offset+size-x))
 		if toWrite > 0 {
 			crc = crc.Update(buf[0:toWrite])
+			// the crc.Value() function is to be deprecated. this double checking is for backward compatibility
+			// with seaweed version using crc.Value() instead of uint32(crc), which appears in commit 056c480eb
+			// and switch appeared in version 3.09.
+			if offset == 0 && size == int64(n.DataSize) && int64(count) == size && (n.Checksum != crc && uint32(n.Checksum) != crc.Value()) {
+				// This check works only if the buffer is big enough to hold the whole needle data
+				// and we ask for all needle data.
+				// Otherwise we cannot check the validity of partially aquired data.
+				stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorCRC).Inc()
+				return fmt.Errorf("ReadNeedleData checksum %v expected %v for Needle: %v,%v", crc, n.Checksum, v.Id, n)
+			}
 			if _, err = writer.Write(buf[0:toWrite]); err != nil {
 				return fmt.Errorf("ReadNeedleData write: %v", err)
 			}
@@ -182,8 +190,11 @@ func (v *Volume) readNeedleDataInto(n *needle.Needle, readOption *ReadOption, wr
 		}
 	}
 	if offset == 0 && size == int64(n.DataSize) && (n.Checksum != crc && uint32(n.Checksum) != crc.Value()) {
-		// the crc.Value() function is to be deprecated. this double checking is for backward compatible.
-		return fmt.Errorf("ReadNeedleData checksum %v expected %v", crc, n.Checksum)
+		// the crc.Value() function is to be deprecated. this double checking is for backward compatibility
+		// with seaweed version using crc.Value() instead of uint32(crc), which appears in commit 056c480eb
+		// and switch appeared in version 3.09.
+		stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorCRC).Inc()
+		return fmt.Errorf("ReadNeedleData checksum %v expected %v for Needle: %v,%v", crc, n.Checksum, v.Id, n)
 	}
 	return nil
 

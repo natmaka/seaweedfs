@@ -3,13 +3,14 @@ package mount
 import (
 	"context"
 	"fmt"
+	"syscall"
+	"time"
+
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"syscall"
-	"time"
 )
 
 /**
@@ -53,7 +54,9 @@ import (
 func (wfs *WFS) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
 	fh := wfs.GetHandle(FileHandleId(in.Fh))
 	if fh == nil {
-		return fuse.ENOENT
+		// If handle is not found, it might have been already released
+		// This is not an error condition for FLUSH
+		return fuse.OK
 	}
 
 	return wfs.doFlush(fh, in.Uid, in.Gid)
@@ -104,9 +107,6 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32) fuse.Status {
 		}
 	}
 
-	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
-	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
-
 	if !fh.dirtyMetadata {
 		return fuse.OK
 	}
@@ -115,14 +115,12 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32) fuse.Status {
 		return fuse.Status(syscall.ENOSPC)
 	}
 
+	fhActiveLock := fh.wfs.fhLockTable.AcquireLock("doFlush", fh.fh, util.ExclusiveLock)
+	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+
 	err := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		fh.entryLock.Lock()
-		defer fh.entryLock.Unlock()
 
 		entry := fh.GetEntry()
-		if entry == nil {
-			return nil
-		}
 		entry.Name = name // this flush may be just after a rename operation
 
 		if entry.Attributes != nil {
@@ -133,15 +131,12 @@ func (wfs *WFS) doFlush(fh *FileHandle, uid, gid uint32) fuse.Status {
 			if entry.Attributes.Gid == 0 {
 				entry.Attributes.Gid = gid
 			}
-			if entry.Attributes.Crtime == 0 {
-				entry.Attributes.Crtime = time.Now().Unix()
-			}
 			entry.Attributes.Mtime = time.Now().Unix()
 		}
 
 		request := &filer_pb.CreateEntryRequest{
 			Directory:                string(dir),
-			Entry:                    entry,
+			Entry:                    entry.GetEntry(),
 			Signatures:               []int32{wfs.signature},
 			SkipCheckParentDirectory: true,
 		}

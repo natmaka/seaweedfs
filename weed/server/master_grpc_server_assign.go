@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"strings"
 	"time"
 
 	"github.com/seaweedfs/raft"
@@ -69,18 +71,12 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 		MemoryMapMaxSizeMb: req.MemoryMapMaxSizeMb,
 	}
 
-	vl := ms.Topo.GetVolumeLayout(option.Collection, option.ReplicaPlacement, option.Ttl, option.DiskType)
-
-	if !vl.HasGrowRequest() && vl.ShouldGrowVolumes(option) {
-		if ms.Topo.AvailableSpaceFor(option) <= 0 {
-			return nil, fmt.Errorf("no free volumes left for " + option.String())
-		}
-		vl.AddGrowRequest()
-		ms.vgCh <- &topology.VolumeGrowRequest{
-			Option: option,
-			Count:  int(req.WritableVolumeCount),
-		}
+	if !ms.Topo.DataCenterExists(option.DataCenter) {
+		return nil, fmt.Errorf("data center %v not found in topology", option.DataCenter)
 	}
+
+	vl := ms.Topo.GetVolumeLayout(option.Collection, option.ReplicaPlacement, option.Ttl, option.DiskType)
+	vl.SetLastGrowCount(req.WritableVolumeCount)
 
 	var (
 		lastErr    error
@@ -89,34 +85,56 @@ func (ms *MasterServer) Assign(ctx context.Context, req *master_pb.AssignRequest
 	)
 
 	for time.Now().Sub(startTime) < maxTimeout {
-		fid, count, dnList, err := ms.Topo.PickForWrite(req.Count, option)
-		if err == nil {
-			dn := dnList.Head()
-			var replicas []*master_pb.Location
-			for _, r := range dnList.Rest() {
-				replicas = append(replicas, &master_pb.Location{
-					Url:        r.Url(),
-					PublicUrl:  r.PublicUrl,
-					GrpcPort:   uint32(r.GrpcPort),
-					DataCenter: r.GetDataCenterId(),
-				})
+		fid, count, dnList, shouldGrow, err := ms.Topo.PickForWrite(req.Count, option, vl)
+		if shouldGrow && !vl.HasGrowRequest() {
+			if err != nil && ms.Topo.AvailableSpaceFor(option) <= 0 {
+				err = fmt.Errorf("%s and no free volumes left for %s", err.Error(), option.String())
 			}
-			return &master_pb.AssignResponse{
-				Fid: fid,
-				Location: &master_pb.Location{
-					Url:        dn.Url(),
-					PublicUrl:  dn.PublicUrl,
-					GrpcPort:   uint32(dn.GrpcPort),
-					DataCenter: dn.GetDataCenterId(),
-				},
-				Count:    count,
-				Auth:     string(security.GenJwtForVolumeServer(ms.guard.SigningKey, ms.guard.ExpiresAfterSec, fid)),
-				Replicas: replicas,
-			}, nil
+			vl.AddGrowRequest()
+			ms.volumeGrowthRequestChan <- &topology.VolumeGrowRequest{
+				Option: option,
+				Count:  req.WritableVolumeCount,
+				Reason: "grpc assign",
+			}
 		}
-		//glog.V(4).Infoln("waiting for volume growing...")
-		lastErr = err
-		time.Sleep(200 * time.Millisecond)
+		if err != nil {
+			glog.V(1).Infof("assign %v %v: %v", req, option.String(), err)
+			stats.MasterPickForWriteErrorCounter.Inc()
+			lastErr = err
+			if (req.DataCenter != "" || req.Rack != "") && strings.Contains(err.Error(), topology.NoWritableVolumes) {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		dn := dnList.Head()
+		if dn == nil {
+			continue
+		}
+		var replicas []*master_pb.Location
+		for _, r := range dnList.Rest() {
+			replicas = append(replicas, &master_pb.Location{
+				Url:        r.Url(),
+				PublicUrl:  r.PublicUrl,
+				GrpcPort:   uint32(r.GrpcPort),
+				DataCenter: r.GetDataCenterId(),
+			})
+		}
+		return &master_pb.AssignResponse{
+			Fid: fid,
+			Location: &master_pb.Location{
+				Url:        dn.Url(),
+				PublicUrl:  dn.PublicUrl,
+				GrpcPort:   uint32(dn.GrpcPort),
+				DataCenter: dn.GetDataCenterId(),
+			},
+			Count:    count,
+			Auth:     string(security.GenJwtForVolumeServer(ms.guard.SigningKey, ms.guard.ExpiresAfterSec, fid)),
+			Replicas: replicas,
+		}, nil
+	}
+	if lastErr != nil {
+		glog.V(0).Infof("assign %v %v: %v", req, option.String(), lastErr)
 	}
 	return nil, lastErr
 }

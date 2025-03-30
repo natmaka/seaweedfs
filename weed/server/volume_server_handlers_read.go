@@ -2,6 +2,7 @@ package weed_server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 
@@ -25,17 +27,18 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 var fileNameEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
 
 func NotFound(w http.ResponseWriter) {
-	stats.VolumeServerRequestCounter.WithLabelValues(stats.ErrorGetNotFound).Inc()
+	stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorGetNotFound).Inc()
 	w.WriteHeader(http.StatusNotFound)
 }
 
 func InternalError(w http.ResponseWriter) {
-	stats.VolumeServerRequestCounter.WithLabelValues(stats.ErrorGetInternal).Inc()
+	stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorGetInternal).Inc()
 	w.WriteHeader(http.StatusInternalServerError)
 }
 
@@ -79,10 +82,11 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 		}
 		if vs.ReadMode == "proxy" {
 			// proxy client request to target server
-			u, _ := url.Parse(util.NormalizeUrl(lookupResult.Locations[0].Url))
+			rawURL, _ := util_http.NormalizeUrl(lookupResult.Locations[0].Url)
+			u, _ := url.Parse(rawURL)
 			r.URL.Host = u.Host
 			r.URL.Scheme = u.Scheme
-			request, err := http.NewRequest("GET", r.URL.String(), nil)
+			request, err := http.NewRequest(http.MethodGet, r.URL.String(), nil)
 			if err != nil {
 				glog.V(0).Infof("failed to instance http request of url %s: %v", r.URL.String(), err)
 				InternalError(w)
@@ -94,13 +98,13 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 				}
 			}
 
-			response, err := client.Do(request)
+			response, err := util_http.GetGlobalHttpClient().Do(request)
 			if err != nil {
 				glog.V(0).Infof("request remote url %s: %v", r.URL.String(), err)
 				InternalError(w)
 				return
 			}
-			defer util.CloseResponse(response)
+			defer util_http.CloseResponse(response)
 			// proxy target response to client
 			for k, vv := range response.Header {
 				for _, v := range vv {
@@ -114,7 +118,8 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 			return
 		} else {
 			// redirect
-			u, _ := url.Parse(util.NormalizeUrl(lookupResult.Locations[0].PublicUrl))
+			rawURL, _ := util_http.NormalizeUrl(lookupResult.Locations[0].PublicUrl)
+			u, _ := url.Parse(rawURL)
 			u.Path = fmt.Sprintf("%s/%s,%s", u.Path, vid, fid)
 			arg := url.Values{}
 			if c := r.FormValue("collection"); c != "" {
@@ -184,7 +189,7 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	setEtag(w, n.Etag())
+	SetEtag(w, n.Etag())
 
 	if n.HasPairs() {
 		pairMap := make(map[string]string)
@@ -251,7 +256,7 @@ func shouldAttemptStreamWrite(hasLocalVolume bool, ext string, r *http.Request) 
 	if len(ext) > 0 {
 		ext = strings.ToLower(ext)
 	}
-	if r.Method == "HEAD" {
+	if r.Method == http.MethodHead {
 		return true, true
 	}
 	_, _, _, shouldResize := shouldResizeImages(ext, r)
@@ -290,7 +295,7 @@ func (vs *VolumeServer) tryHandleChunkedFile(n *needle.Needle, fileName string, 
 
 	w.Header().Set("X-File-Store", "chunked")
 
-	chunkedFileReader := operation.NewChunkedFileReader(chunkManifest.Chunks, vs.GetMaster(), vs.grpcDialOption)
+	chunkedFileReader := operation.NewChunkedFileReader(chunkManifest.Chunks, vs.GetMaster(context.Background()), vs.grpcDialOption)
 	defer chunkedFileReader.Close()
 
 	rs := conditionallyCropImages(chunkedFileReader, ext, r)
@@ -375,19 +380,21 @@ func writeResponseContent(filename, mimeType string, rs io.ReadSeeker, w http.Re
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
 
-	adjustPassthroughHeaders(w, r, filename)
+	AdjustPassthroughHeaders(w, r, filename)
 
-	if r.Method == "HEAD" {
+	if r.Method == http.MethodHead {
 		w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
 		return nil
 	}
 
-	return processRangeRequest(r, w, totalSize, mimeType, func(writer io.Writer, offset int64, size int64) error {
-		if _, e = rs.Seek(offset, 0); e != nil {
+	return ProcessRangeRequest(r, w, totalSize, mimeType, func(offset int64, size int64) (filer.DoStreamContent, error) {
+		return func(writer io.Writer) error {
+			if _, e = rs.Seek(offset, 0); e != nil {
+				return e
+			}
+			_, e = io.CopyN(writer, rs, size)
 			return e
-		}
-		_, e = io.CopyN(writer, rs, size)
-		return e
+		}, nil
 	})
 }
 
@@ -402,15 +409,17 @@ func (vs *VolumeServer) streamWriteResponseContent(filename string, mimeType str
 		w.Header().Set("Content-Type", mimeType)
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
-	adjustPassthroughHeaders(w, r, filename)
+	AdjustPassthroughHeaders(w, r, filename)
 
-	if r.Method == "HEAD" {
+	if r.Method == http.MethodHead {
 		w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
 		return
 	}
 
-	processRangeRequest(r, w, totalSize, mimeType, func(writer io.Writer, offset int64, size int64) error {
-		return vs.store.ReadVolumeNeedleDataInto(volumeId, n, readOption, writer, offset, size)
+	ProcessRangeRequest(r, w, totalSize, mimeType, func(offset int64, size int64) (filer.DoStreamContent, error) {
+		return func(writer io.Writer) error {
+			return vs.store.ReadVolumeNeedleDataInto(volumeId, n, readOption, writer, offset, size)
+		}, nil
 	})
 
 }

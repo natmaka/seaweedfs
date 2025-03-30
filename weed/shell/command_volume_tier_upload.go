@@ -4,9 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"io"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 
 	"google.golang.org/grpc"
 
@@ -53,6 +54,10 @@ func (c *commandVolumeTierUpload) Help() string {
 	The index file is still local, and the same O(1) disk read is applied to the remote file.
 
 `
+}
+
+func (c *commandVolumeTierUpload) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandVolumeTierUpload) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -102,7 +107,7 @@ func doVolumeTierUpload(commandEnv *CommandEnv, writer io.Writer, collection str
 		return fmt.Errorf("volume %d not found", vid)
 	}
 
-	err = markVolumeReplicasWritable(commandEnv.option.GrpcDialOption, vid, existingLocations, false)
+	err = markVolumeReplicasWritable(commandEnv.option.GrpcDialOption, vid, existingLocations, false, false)
 	if err != nil {
 		return fmt.Errorf("mark volume %d as readonly on %s: %v", vid, existingLocations[0].Url, err)
 	}
@@ -113,11 +118,14 @@ func doVolumeTierUpload(commandEnv *CommandEnv, writer io.Writer, collection str
 		return fmt.Errorf("copy dat file for volume %d on %s to %s: %v", vid, existingLocations[0].Url, dest, err)
 	}
 
+	if keepLocalDatFile {
+		return nil
+	}
 	// now the first replica has the .idx and .vif files.
 	// ask replicas on other volume server to delete its own local copy
 	for i, location := range existingLocations {
 		if i == 0 {
-			break
+			continue
 		}
 		fmt.Printf("delete volume %d from %s\n", vid, location.Url)
 		err = deleteVolume(commandEnv.option.GrpcDialOption, vid, location.ServerAddress(), false)
@@ -139,6 +147,12 @@ func uploadDatToRemoteTier(grpcDialOption grpc.DialOption, writer io.Writer, vol
 			KeepLocalDatFile:       keepLocalDatFile,
 		})
 
+		if stream == nil && copyErr == nil {
+			// when the volume is already uploaded, VolumeTierMoveDatToRemote will return nil stream and nil error
+			// so we should directly return in this case
+			fmt.Fprintf(writer, "volume %v already uploaded", volumeId)
+			return nil
+		}
 		var lastProcessed int64
 		for {
 			resp, recvErr := stream.Recv()

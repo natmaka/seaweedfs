@@ -14,7 +14,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-func CheckAndFixVolumeDataIntegrity(v *Volume, indexFile *os.File) (lastAppendAtNs uint64, err error) {
+func CheckVolumeDataIntegrity(v *Volume, indexFile *os.File) (lastAppendAtNs uint64, err error) {
 	var indexSize int64
 	if indexSize, err = verifyIndexFileIntegrity(indexFile); err != nil {
 		return 0, fmt.Errorf("verifyIndexFileIntegrity %s failed: %v", indexFile.Name(), err)
@@ -35,11 +35,7 @@ func CheckAndFixVolumeDataIntegrity(v *Volume, indexFile *os.File) (lastAppendAt
 		}
 	}
 	if healthyIndexSize < indexSize {
-		glog.Warningf("CheckAndFixVolumeDataIntegrity truncate idx file %s from %d to %d", indexFile.Name(), indexSize, healthyIndexSize)
-		err = indexFile.Truncate(healthyIndexSize)
-		if err != nil {
-			glog.Warningf("CheckAndFixVolumeDataIntegrity truncate idx file %s from %d to %d: %v", indexFile.Name(), indexSize, healthyIndexSize, err)
-		}
+		return 0, fmt.Errorf("CheckVolumeDataIntegrity %s failed: index size %d differs from healthy size %d", indexFile.Name(), indexSize, healthyIndexSize)
 	}
 	return
 }
@@ -60,6 +56,9 @@ func doCheckAndFixVolumeData(v *Volume, indexFile *os.File, indexOffset int64) (
 		}
 	} else {
 		if lastAppendAtNs, err = verifyNeedleIntegrity(v.DataBackend, v.Version(), offset.ToActualOffset(), key, size); err != nil {
+			if err == ErrorSizeMismatch {
+				return verifyNeedleIntegrity(v.DataBackend, v.Version(), offset.ToActualOffset()+int64(MaxPossibleVolumeSize), key, size)
+			}
 			return lastAppendAtNs, err
 		}
 	}
@@ -81,7 +80,11 @@ func readIndexEntryAtOffset(indexFile *os.File, offset int64) (bytes []byte, err
 		return
 	}
 	bytes = make([]byte, NeedleMapEntrySize)
-	_, err = indexFile.ReadAt(bytes, offset)
+	var readCount int
+	readCount, err = indexFile.ReadAt(bytes, offset)
+	if err == io.EOF && readCount == NeedleMapEntrySize {
+		err = nil
+	}
 	return
 }
 
@@ -98,7 +101,11 @@ func verifyNeedleIntegrity(datFile backend.BackendStorageFile, v needle.Version,
 	}
 	if v == needle.Version3 {
 		bytes := make([]byte, TimestampSize)
-		_, err = datFile.ReadAt(bytes, offset+NeedleHeaderSize+int64(size)+needle.NeedleChecksumSize)
+		var readCount int
+		readCount, err = datFile.ReadAt(bytes, offset+NeedleHeaderSize+int64(size)+needle.NeedleChecksumSize)
+		if err == io.EOF && readCount == TimestampSize {
+			err = nil
+		}
 		if err == io.EOF {
 			return 0, err
 		}
@@ -115,12 +122,8 @@ func verifyNeedleIntegrity(datFile backend.BackendStorageFile, v needle.Version,
 			return n.AppendAtNs, nil
 		}
 		if fileSize > fileTailOffset {
-			glog.Warningf("Truncate %s from %d bytes to %d bytes!", datFile.Name(), fileSize, fileTailOffset)
-			err = datFile.Truncate(fileTailOffset)
-			if err == nil {
-				return n.AppendAtNs, nil
-			}
-			return n.AppendAtNs, fmt.Errorf("truncate file %s: %v", datFile.Name(), err)
+			glog.Warningf("data file %s actual %d bytes expected %d bytes!", datFile.Name(), fileSize, fileTailOffset)
+			return n.AppendAtNs, fmt.Errorf("data file %s actual %d bytes expected %d bytes", datFile.Name(), fileSize, fileTailOffset)
 		}
 		glog.Warningf("data file %s has %d bytes, less than expected %d bytes!", datFile.Name(), fileSize, fileTailOffset)
 	}
@@ -128,7 +131,7 @@ func verifyNeedleIntegrity(datFile backend.BackendStorageFile, v needle.Version,
 		return n.AppendAtNs, fmt.Errorf("read data [%d,%d) : %v", offset, offset+int64(size), err)
 	}
 	if n.Id != key {
-		return n.AppendAtNs, fmt.Errorf("index key %#x does not match needle's Id %#x", key, n.Id)
+		return n.AppendAtNs, fmt.Errorf("index key %v does not match needle's Id %v", key, n.Id)
 	}
 	return n.AppendAtNs, err
 }
@@ -145,7 +148,7 @@ func verifyDeletedNeedleIntegrity(datFile backend.BackendStorageFile, v needle.V
 		return n.AppendAtNs, fmt.Errorf("read data [%d,%d) : %v", fileSize-size, size, err)
 	}
 	if n.Id != key {
-		return n.AppendAtNs, fmt.Errorf("index key %#x does not match needle's Id %#x", key, n.Id)
+		return n.AppendAtNs, fmt.Errorf("index key %v does not match needle's Id %v", key, n.Id)
 	}
 	return n.AppendAtNs, err
 }

@@ -332,7 +332,10 @@ func TestMisplacedChecking(t *testing.T) {
 					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn1"}},
 				},
 				{
-					location: &location{"dc1", "r2", &master_pb.DataNodeInfo{Id: "dn2"}},
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn2"}},
+				},
+				{
+					location: &location{"dc1", "r2", &master_pb.DataNodeInfo{Id: "dn3"}},
 				},
 			},
 			expected: false,
@@ -345,10 +348,13 @@ func TestMisplacedChecking(t *testing.T) {
 					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn1"}},
 				},
 				{
-					location: &location{"dc1", "r2", &master_pb.DataNodeInfo{Id: "dn2"}},
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn2"}},
+				},
+				{
+					location: &location{"dc2", "r2", &master_pb.DataNodeInfo{Id: "dn3"}},
 				},
 			},
-			expected: false,
+			expected: true,
 		},
 		{
 			name:        "test 100",
@@ -431,4 +437,91 @@ func TestPickingMisplacedVolumeToDelete(t *testing.T) {
 		}
 	}
 
+}
+
+func TestSatisfyReplicaCurrentLocation(t *testing.T) {
+
+	var tests = []testcase{
+		{
+			name:        "test 001",
+			replication: "001",
+			replicas: []*VolumeReplica{
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn1"}},
+				},
+				{
+					location: &location{"dc1", "r2", &master_pb.DataNodeInfo{Id: "dn2"}},
+				},
+			},
+			expected: false,
+		},
+		{
+			name:        "test 010",
+			replication: "010",
+			replicas: []*VolumeReplica{
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn1"}},
+				},
+				{
+					location: &location{"dc1", "r2", &master_pb.DataNodeInfo{Id: "dn2"}},
+				},
+			},
+			expected: true,
+		},
+		{
+			name:        "test 011",
+			replication: "011",
+			replicas: []*VolumeReplica{
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn1"}},
+				},
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn2"}},
+				},
+				{
+					location: &location{"dc1", "r2", &master_pb.DataNodeInfo{Id: "dn3"}},
+				},
+			},
+			expected: true,
+		},
+		{
+			name:        "test 110",
+			replication: "110",
+			replicas: []*VolumeReplica{
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn1"}},
+				},
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn2"}},
+				},
+				{
+					location: &location{"dc2", "r2", &master_pb.DataNodeInfo{Id: "dn3"}},
+				},
+			},
+			expected: true,
+		},
+		{
+			name:        "test 100",
+			replication: "100",
+			replicas: []*VolumeReplica{
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn1"}},
+				},
+				{
+					location: &location{"dc1", "r2", &master_pb.DataNodeInfo{Id: "dn2"}},
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			replicaPlacement, _ := super_block.NewReplicaPlacementFromString(tt.replication)
+			if satisfyReplicaCurrentLocation(replicaPlacement, tt.replicas) != tt.expected {
+				t.Errorf("%s: expect %v %v %+v",
+					tt.name, tt.expected, tt.replication, tt.replicas)
+			}
+		})
+	}
 }

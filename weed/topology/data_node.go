@@ -2,6 +2,8 @@ package topology
 
 import (
 	"fmt"
+	"sync/atomic"
+
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
@@ -9,7 +11,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"sync/atomic"
 )
 
 type DataNode struct {
@@ -79,11 +80,10 @@ func (dn *DataNode) UpdateVolumes(actualVolumes []storage.VolumeInfo) (newVolume
 		if _, ok := actualVolumeMap[vid]; !ok {
 			glog.V(0).Infoln("Deleting volume id:", vid)
 			disk := dn.getOrCreateDisk(v.DiskType)
-			delete(disk.volumes, vid)
+			disk.DeleteVolumeById(vid)
 			deletedVolumes = append(deletedVolumes, v)
 
-			deltaDiskUsages := newDiskUsages()
-			deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(types.ToDiskType(v.DiskType))
+			deltaDiskUsage := &DiskUsageCounts{}
 			deltaDiskUsage.volumeCount = -1
 			if v.IsRemote() {
 				deltaDiskUsage.remoteVolumeCount = -1
@@ -91,7 +91,7 @@ func (dn *DataNode) UpdateVolumes(actualVolumes []storage.VolumeInfo) (newVolume
 			if !v.ReadOnly {
 				deltaDiskUsage.activeVolumeCount = -1
 			}
-			disk.UpAdjustDiskUsageDelta(deltaDiskUsages)
+			disk.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), deltaDiskUsage)
 		}
 	}
 	for _, v := range actualVolumes {
@@ -112,13 +112,14 @@ func (dn *DataNode) DeltaUpdateVolumes(newVolumes, deletedVolumes []storage.Volu
 
 	for _, v := range deletedVolumes {
 		disk := dn.getOrCreateDisk(v.DiskType)
-		if _, found := disk.volumes[v.Id]; !found {
+
+		_, err := disk.GetVolumesById(v.Id)
+		if err != nil {
 			continue
 		}
-		delete(disk.volumes, v.Id)
+		disk.DeleteVolumeById(v.Id)
 
-		deltaDiskUsages := newDiskUsages()
-		deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(types.ToDiskType(v.DiskType))
+		deltaDiskUsage := &DiskUsageCounts{}
 		deltaDiskUsage.volumeCount = -1
 		if v.IsRemote() {
 			deltaDiskUsage.remoteVolumeCount = -1
@@ -126,7 +127,7 @@ func (dn *DataNode) DeltaUpdateVolumes(newVolumes, deletedVolumes []storage.Volu
 		if !v.ReadOnly {
 			deltaDiskUsage.activeVolumeCount = -1
 		}
-		disk.UpAdjustDiskUsageDelta(deltaDiskUsages)
+		disk.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), deltaDiskUsage)
 	}
 	for _, v := range newVolumes {
 		dn.doAddOrUpdateVolume(v)
@@ -135,7 +136,6 @@ func (dn *DataNode) DeltaUpdateVolumes(newVolumes, deletedVolumes []storage.Volu
 }
 
 func (dn *DataNode) AdjustMaxVolumeCounts(maxVolumeCounts map[string]uint32) {
-	deltaDiskUsages := newDiskUsages()
 	for diskType, maxVolumeCount := range maxVolumeCounts {
 		if maxVolumeCount == 0 {
 			// the volume server may have set the max to zero
@@ -148,9 +148,9 @@ func (dn *DataNode) AdjustMaxVolumeCounts(maxVolumeCounts map[string]uint32) {
 			continue
 		}
 		disk := dn.getOrCreateDisk(dt.String())
-		deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(dt)
-		deltaDiskUsage.maxVolumeCount = int64(maxVolumeCount) - currentDiskUsageMaxVolumeCount
-		disk.UpAdjustDiskUsageDelta(deltaDiskUsages)
+		disk.UpAdjustDiskUsageDelta(dt, &DiskUsageCounts{
+			maxVolumeCount: int64(maxVolumeCount) - currentDiskUsageMaxVolumeCount,
+		})
 	}
 }
 
@@ -170,8 +170,9 @@ func (dn *DataNode) GetVolumesById(id needle.VolumeId) (vInfo storage.VolumeInfo
 	found := false
 	for _, c := range dn.children {
 		disk := c.(*Disk)
-		vInfo, found = disk.volumes[id]
-		if found {
+		vInfo, err = disk.GetVolumesById(id)
+		if err == nil {
+			found = true
 			break
 		}
 	}

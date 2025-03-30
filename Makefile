@@ -1,3 +1,5 @@
+.PHONY: test
+
 BINARY = weed
 
 SOURCE_DIR = .
@@ -12,10 +14,10 @@ warp_install:
 	go install github.com/minio/warp@v0.7.6
 
 full_install:
-	cd weed; go install -tags "elastic gocdk sqlite ydb tikv"
+	cd weed; go install -tags "elastic gocdk sqlite ydb tarantool tikv rclone"
 
 server: install
-	weed -v 4 server -s3 -filer -volume.max=0 -master.volumeSizeLimitMB=1024 -volume.preStopSeconds=1 -s3.port=8000 -s3.allowEmptyFolder=false -s3.allowDeleteBucketNotEmpty=false -s3.config=./docker/compose/s3.json
+	weed -v 0 server -s3 -filer -filer.maxMB=64 -volume.max=0 -master.volumeSizeLimitMB=1024 -volume.preStopSeconds=1 -s3.port=8000 -s3.allowEmptyFolder=false -s3.allowDeleteBucketNotEmpty=true -s3.config=./docker/compose/s3.json -metricsPort=9324
 
 benchmark: install warp_install
 	pkill weed || true
@@ -32,4 +34,4 @@ benchmark_with_pprof: debug = 1
 benchmark_with_pprof: benchmark
 
 test:
-	cd weed; go test -tags "elastic gocdk sqlite ydb tikv" -v ./...
+	cd weed; go test -tags "elastic gocdk sqlite ydb tarantool tikv rclone" -v ./...

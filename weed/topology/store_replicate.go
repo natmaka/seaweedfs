@@ -19,6 +19,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/buffer_pool"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 func ReplicatedWrite(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOption, s *storage.Store, volumeId needle.VolumeId, n *needle.Needle, r *http.Request, contentMd5 string) (isUnchanged bool, err error) {
@@ -45,10 +47,15 @@ func ReplicatedWrite(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOpt
 
 	if s.GetVolume(volumeId) != nil {
 		start := time.Now()
+
+		inFlightGauge := stats.VolumeServerInFlightRequestsGauge.WithLabelValues(stats.WriteToLocalDisk)
+		inFlightGauge.Inc()
+		defer inFlightGauge.Dec()
+
 		isUnchanged, err = s.WriteVolumeNeedle(volumeId, n, true, fsync)
 		stats.VolumeServerRequestHistogram.WithLabelValues(stats.WriteToLocalDisk).Observe(time.Since(start).Seconds())
 		if err != nil {
-			stats.VolumeServerRequestCounter.WithLabelValues(stats.ErrorWriteToLocalDisk).Inc()
+			stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorWriteToLocalDisk).Inc()
 			err = fmt.Errorf("failed to write to local disk: %v", err)
 			glog.V(0).Infoln(err)
 			return
@@ -57,6 +64,11 @@ func ReplicatedWrite(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOpt
 
 	if len(remoteLocations) > 0 { //send to other replica locations
 		start := time.Now()
+
+		inFlightGauge := stats.VolumeServerInFlightRequestsGauge.WithLabelValues(stats.WriteToReplicas)
+		inFlightGauge.Inc()
+		defer inFlightGauge.Dec()
+
 		err = DistributedOperation(remoteLocations, func(location operation.Location) error {
 			u := url.URL{
 				Scheme: "http",
@@ -80,13 +92,15 @@ func ReplicatedWrite(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOpt
 				tmpMap := make(map[string]string)
 				err := json.Unmarshal(n.Pairs, &tmpMap)
 				if err != nil {
-					stats.VolumeServerRequestCounter.WithLabelValues(stats.ErrorUnmarshalPairs).Inc()
+					stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorUnmarshalPairs).Inc()
 					glog.V(0).Infoln("Unmarshal pairs error:", err)
 				}
 				for k, v := range tmpMap {
 					pairMap[needle.PairNamePrefix+k] = v
 				}
 			}
+			bytesBuffer := buffer_pool.SyncPoolGetBuffer()
+			defer buffer_pool.SyncPoolPutBuffer(bytesBuffer)
 
 			// volume server do not know about encryption
 			// TODO optimize here to compress data only once
@@ -99,9 +113,15 @@ func ReplicatedWrite(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOpt
 				PairMap:           pairMap,
 				Jwt:               jwt,
 				Md5:               contentMd5,
+				BytesBuffer:       bytesBuffer,
 			}
 
-			_, err := operation.UploadData(n.Data, uploadOption)
+			uploader, err := operation.NewUploader()
+			if err != nil {
+				glog.Errorf("replication-UploadData, err:%v, url:%s", err, u.String())
+				return err
+			}
+			_, err = uploader.UploadData(n.Data, uploadOption)
 			if err != nil {
 				glog.Errorf("replication-UploadData, err:%v, url:%s", err, u.String())
 			}
@@ -109,7 +129,7 @@ func ReplicatedWrite(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOpt
 		})
 		stats.VolumeServerRequestHistogram.WithLabelValues(stats.WriteToReplicas).Observe(time.Since(start).Seconds())
 		if err != nil {
-			stats.VolumeServerRequestCounter.WithLabelValues(stats.ErrorWriteToReplicas).Inc()
+			stats.VolumeServerHandlerCounter.WithLabelValues(stats.ErrorWriteToReplicas).Inc()
 			err = fmt.Errorf("failed to write to replicas for volume %d: %v", volumeId, err)
 			glog.V(0).Infoln(err)
 			return false, err
@@ -140,7 +160,7 @@ func ReplicatedDelete(masterFn operation.GetMasterFn, grpcDialOption grpc.DialOp
 
 	if len(remoteLocations) > 0 { //send to other replica locations
 		if err = DistributedOperation(remoteLocations, func(location operation.Location) error {
-			return util.Delete("http://"+location.Url+r.URL.Path+"?type=replicate", string(jwt))
+			return util_http.Delete("http://"+location.Url+r.URL.Path+"?type=replicate", string(jwt))
 		}); err != nil {
 			size = 0
 		}

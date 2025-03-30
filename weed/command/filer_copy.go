@@ -22,7 +22,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
-	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 )
 
 var (
@@ -31,21 +30,21 @@ var (
 )
 
 type CopyOptions struct {
-	include          *string
-	replication      *string
-	collection       *string
-	ttl              *string
-	diskType         *string
-	maxMB            *int
-	masterClient     *wdclient.MasterClient
-	concurrentFiles  *int
-	concurrentChunks *int
-	grpcDialOption   grpc.DialOption
-	masters          []string
-	cipher           bool
-	ttlSec           int32
-	checkSize        *bool
-	verbose          *bool
+	include            *string
+	replication        *string
+	collection         *string
+	ttl                *string
+	diskType           *string
+	maxMB              *int
+	concurrentFiles    *int
+	concurrentChunks   *int
+	grpcDialOption     grpc.DialOption
+	masters            []string
+	cipher             bool
+	ttlSec             int32
+	checkSize          *bool
+	verbose            *bool
+	volumeServerAccess *string
 }
 
 func init() {
@@ -61,6 +60,7 @@ func init() {
 	copy.concurrentChunks = cmdFilerCopy.Flag.Int("concurrentChunks", 8, "concurrent chunk copy goroutines for each file")
 	copy.checkSize = cmdFilerCopy.Flag.Bool("check.size", false, "copy when the target file size is different from the source file")
 	copy.verbose = cmdFilerCopy.Flag.Bool("verbose", false, "print out details during copying")
+	copy.volumeServerAccess = cmdFilerCopy.Flag.String("volumeServerAccess", "direct", "access volume servers by [direct|publicUrl]")
 }
 
 var cmdFilerCopy = &Command{
@@ -81,7 +81,7 @@ var cmdFilerCopy = &Command{
 
 func runCopy(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 
 	if len(args) <= 1 {
 		return false
@@ -342,7 +342,12 @@ func (worker *FileCopyWorker) uploadFileAsOne(task FileCopyTask, f *os.File) err
 			return err
 		}
 
-		finalFileId, uploadResult, flushErr, _ := operation.UploadWithRetry(
+		uploader, uploaderErr := operation.NewUploader()
+		if uploaderErr != nil {
+			return uploaderErr
+		}
+
+		finalFileId, uploadResult, flushErr, _ := uploader.UploadWithRetry(
 			worker,
 			&filer_pb.AssignVolumeRequest{
 				Count:       1,
@@ -421,7 +426,13 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 				<-concurrentChunks
 			}()
 
-			fileId, uploadResult, err, _ := operation.UploadWithRetry(
+			uploader, err := operation.NewUploader()
+			if err != nil {
+				uploadError = fmt.Errorf("upload data %v: %v\n", fileName, err)
+				return
+			}
+
+			fileId, uploadResult, err, _ := uploader.UploadWithRetry(
 				worker,
 				&filer_pb.AssignVolumeRequest{
 					Count:       1,
@@ -470,7 +481,7 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 		for _, chunk := range chunks {
 			fileIds = append(fileIds, chunk.FileId)
 		}
-		operation.DeleteFiles(func() pb.ServerAddress {
+		operation.DeleteFileIds(func(_ context.Context) pb.ServerAddress {
 			return pb.ServerAddress(copy.masters[0])
 		}, false, worker.options.grpcDialOption, fileIds)
 		return uploadError
@@ -533,8 +544,12 @@ func detectMimeType(f *os.File) string {
 }
 
 func (worker *FileCopyWorker) saveDataAsChunk(reader io.Reader, name string, offset int64, tsNs int64) (chunk *filer_pb.FileChunk, err error) {
+	uploader, uploaderErr := operation.NewUploader()
+	if uploaderErr != nil {
+		return nil, fmt.Errorf("upload data: %v", uploaderErr)
+	}
 
-	finalFileId, uploadResult, flushErr, _ := operation.UploadWithRetry(
+	finalFileId, uploadResult, flushErr, _ := uploader.UploadWithRetry(
 		worker,
 		&filer_pb.AssignVolumeRequest{
 			Count:       1,
@@ -580,6 +595,9 @@ func (worker *FileCopyWorker) WithFilerClient(streamingMode bool, fn func(filer_
 }
 
 func (worker *FileCopyWorker) AdjustedUrl(location *filer_pb.Location) string {
+	if *worker.options.volumeServerAccess == "publicUrl" {
+		return location.PublicUrl
+	}
 	return location.Url
 }
 

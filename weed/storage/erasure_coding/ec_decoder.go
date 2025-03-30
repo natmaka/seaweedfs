@@ -150,7 +150,7 @@ func iterateEcjFile(baseFileName string, processNeedleFn func(key types.NeedleId
 
 }
 
-// WriteDatFile generates .dat from from .ec00 ~ .ec09 files
+// WriteDatFile generates .dat from .ec00 ~ .ec09 files
 func WriteDatFile(baseFileName string, datFileSize int64, shardFileNames []string) error {
 
 	datFile, openErr := os.OpenFile(baseFileName+".dat", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
@@ -180,7 +180,7 @@ func WriteDatFile(baseFileName string, datFileSize int64, shardFileNames []strin
 		for shardId := 0; shardId < DataShardsCount; shardId++ {
 			w, err := io.CopyN(datFile, inputFiles[shardId], ErasureCodingLargeBlockSize)
 			if w != ErasureCodingLargeBlockSize {
-				return fmt.Errorf("copy %s large block %d: %v", baseFileName, shardId, err)
+				return fmt.Errorf("copy %s large block on shardId %d: %v", baseFileName, shardId, err)
 			}
 			datFileSize -= ErasureCodingLargeBlockSize
 		}

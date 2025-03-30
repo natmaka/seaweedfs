@@ -3,12 +3,13 @@ package erasure_coding
 import (
 	"errors"
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"math"
 	"os"
 	"sync"
 	"time"
 
-	"golang.org/x/exp/slices"
+	"slices"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
@@ -20,7 +21,8 @@ import (
 )
 
 var (
-	NotFoundError = errors.New("needle not found")
+	NotFoundError             = errors.New("needle not found")
+	destroyDelaySeconds int64 = 0
 )
 
 type EcVolume struct {
@@ -39,6 +41,8 @@ type EcVolume struct {
 	ecjFile                   *os.File
 	ecjFileAccessLock         sync.Mutex
 	diskType                  types.DiskType
+	datFileSize               int64
+	ExpireAtSec               uint64 //ec volume destroy time, calculated from the ec volume was created
 }
 
 func NewEcVolume(diskType types.DiskType, dir string, dirIdx string, collection string, vid needle.VolumeId) (ev *EcVolume, err error) {
@@ -68,7 +72,10 @@ func NewEcVolume(diskType types.DiskType, dir string, dirIdx string, collection 
 	ev.Version = needle.Version3
 	if volumeInfo, _, found, _ := volume_info.MaybeLoadVolumeInfo(dataBaseFileName + ".vif"); found {
 		ev.Version = needle.Version(volumeInfo.Version)
+		ev.datFileSize = volumeInfo.DatFileSize
+		ev.ExpireAtSec = volumeInfo.ExpireAtSec
 	} else {
+		glog.Warningf("vif file not found,volumeId:%d, filename:%s", vid, dataBaseFileName)
 		volume_info.SaveVolumeInfo(dataBaseFileName+".vif", &volume_server_pb.VolumeInfo{Version: uint32(ev.Version)})
 	}
 
@@ -196,9 +203,10 @@ func (ev *EcVolume) ToVolumeEcShardInformationMessage() (messages []*master_pb.V
 	for _, s := range ev.Shards {
 		if s.VolumeId != prevVolumeId {
 			m = &master_pb.VolumeEcShardInformationMessage{
-				Id:         uint32(s.VolumeId),
-				Collection: s.Collection,
-				DiskType:   string(ev.diskType),
+				Id:          uint32(s.VolumeId),
+				Collection:  s.Collection,
+				DiskType:    string(ev.diskType),
+				ExpireAtSec: ev.ExpireAtSec,
 			}
 			messages = append(messages, m)
 		}
@@ -222,8 +230,17 @@ func (ev *EcVolume) LocateEcShardNeedle(needleId types.NeedleId, version needle.
 
 func (ev *EcVolume) LocateEcShardNeedleInterval(version needle.Version, offset int64, size types.Size) (intervals []Interval) {
 	shard := ev.Shards[0]
+	// Usually shard will be padded to round of ErasureCodingSmallBlockSize.
+	// So in most cases, if shardSize equals to n * ErasureCodingLargeBlockSize,
+	// the data would be in small blocks.
+	shardSize := shard.ecdFileSize - 1
+	if ev.datFileSize > 0 {
+		// To get the correct LargeBlockRowsCount
+		// use datFileSize to calculate the shardSize to match the EC encoding logic.
+		shardSize = ev.datFileSize / DataShardsCount
+	}
 	// calculate the locations in the ec shards
-	intervals = LocateData(ErasureCodingLargeBlockSize, ErasureCodingSmallBlockSize, DataShardsCount*shard.ecdFileSize, offset, types.Size(needle.GetActualSize(size, version)))
+	intervals = LocateData(ErasureCodingLargeBlockSize, ErasureCodingSmallBlockSize, shardSize, offset, types.Size(needle.GetActualSize(size, version)))
 
 	return
 }
@@ -238,8 +255,10 @@ func SearchNeedleFromSortedIndex(ecxFile *os.File, ecxFileSize int64, needleId t
 	l, h := int64(0), ecxFileSize/types.NeedleMapEntrySize
 	for l < h {
 		m := (l + h) / 2
-		if _, err := ecxFile.ReadAt(buf, m*types.NeedleMapEntrySize); err != nil {
-			return types.Offset{}, types.TombstoneFileSize, fmt.Errorf("ecx file %d read at %d: %v", ecxFileSize, m*types.NeedleMapEntrySize, err)
+		if n, err := ecxFile.ReadAt(buf, m*types.NeedleMapEntrySize); err != nil {
+			if n != types.NeedleMapEntrySize {
+				return types.Offset{}, types.TombstoneFileSize, fmt.Errorf("ecx file %d read at %d: %v", ecxFileSize, m*types.NeedleMapEntrySize, err)
+			}
 		}
 		key, offset, size = idx.IdxFileEntry(buf)
 		if key == needleId {
@@ -257,4 +276,8 @@ func SearchNeedleFromSortedIndex(ecxFile *os.File, ecxFileSize int64, needleId t
 
 	err = NotFoundError
 	return
+}
+
+func (ev *EcVolume) IsTimeToDestroy() bool {
+	return ev.ExpireAtSec > 0 && time.Now().Unix() > (int64(ev.ExpireAtSec)+destroyDelaySeconds)
 }

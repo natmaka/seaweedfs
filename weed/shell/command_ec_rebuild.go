@@ -4,10 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"io"
 
 	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
@@ -55,6 +55,10 @@ func (c *commandEcRebuild) Help() string {
 `
 }
 
+func (c *commandEcRebuild) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandEcRebuild) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	fixCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -70,7 +74,7 @@ func (c *commandEcRebuild) Do(args []string, commandEnv *CommandEnv, writer io.W
 	}
 
 	// collect all ec nodes
-	allEcNodes, _, err := collectEcNodes(commandEnv, "")
+	allEcNodes, _, err := collectEcNodes(commandEnv)
 	if err != nil {
 		return err
 	}
@@ -224,7 +228,7 @@ func prepareDataToRecover(commandEnv *CommandEnv, rebuilder *EcNode, collection 
 					Collection:     collection,
 					ShardIds:       []uint32{uint32(shardId)},
 					CopyEcxFile:    needEcxFile,
-					CopyEcjFile:    needEcxFile,
+					CopyEcjFile:    true,
 					CopyVifFile:    needEcxFile,
 					SourceDataNode: ecNodes[0].info.Id,
 				})

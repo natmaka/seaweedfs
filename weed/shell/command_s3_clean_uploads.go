@@ -12,6 +12,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 func init() {
@@ -31,6 +32,10 @@ func (c *commandS3CleanUploads) Help() string {
 		s3.clean.uploads -timeAgo 1.5h
 
 `
+}
+
+func (c *commandS3CleanUploads) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandS3CleanUploads) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -90,7 +95,7 @@ func (c *commandS3CleanUploads) cleanupUploads(commandEnv *CommandEnv, writer io
 		deleteUrl := fmt.Sprintf("http://%s%s/%s?recursive=true&ignoreRecursiveError=true", commandEnv.option.FilerAddress.ToHttpAddress(), uploadsDir, staleUpload)
 		fmt.Fprintf(writer, "purge %s\n", deleteUrl)
 
-		err = util.Delete(deleteUrl, string(encodedJwt))
+		err = util_http.Delete(deleteUrl, string(encodedJwt))
 		if err != nil && err.Error() != "" {
 			return fmt.Errorf("purge %s/%s: %v", uploadsDir, staleUpload, err)
 		}

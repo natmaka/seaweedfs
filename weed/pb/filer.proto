@@ -54,6 +54,9 @@ service SeaweedFiler {
     rpc GetFilerConfiguration (GetFilerConfigurationRequest) returns (GetFilerConfigurationResponse) {
     }
 
+    rpc TraverseBfsMetadata (TraverseBfsMetadataRequest) returns (stream TraverseBfsMetadataResponse) {
+    }
+
     rpc SubscribeMetadata (SubscribeMetadataRequest) returns (stream SubscribeMetadataResponse) {
     }
 
@@ -122,6 +125,7 @@ message Entry {
 
     RemoteEntry remote_entry = 10;
     int64 quota = 11; // for bucket only. Positive/Negative means enabled/disabled.
+    int64 worm_enforced_at_ts_ns = 12;
 }
 
 message FullEntry {
@@ -218,6 +222,7 @@ message DeleteEntryRequest {
     bool ignore_recursive_error = 6;
     bool is_from_other_cluster = 7;
     repeated int32 signatures = 8;
+    int64 if_not_modified_after = 9;
 }
 
 message DeleteEntryResponse {
@@ -341,6 +346,8 @@ message GetFilerConfigurationResponse {
     string version = 11;
     string cluster_id = 12;
     string filer_group = 13;
+    int32 major_version = 14;
+    int32 minor_version = 15;
 }
 
 message SubscribeMetadataRequest {
@@ -360,10 +367,20 @@ message SubscribeMetadataResponse {
     int64 ts_ns = 3;
 }
 
+message TraverseBfsMetadataRequest {
+    string directory = 1;
+    repeated string excluded_prefixes = 2;
+}
+message TraverseBfsMetadataResponse {
+    string directory = 1;
+    Entry entry = 2;
+}
+
 message LogEntry {
     int64 ts_ns = 1;
     int32 partition_key_hash = 2;
     bytes data = 3;
+    bytes key = 4;
 }
 
 message KeepConnectedRequest {
@@ -425,6 +442,10 @@ message FilerConf {
         string rack = 10;
         string data_node = 11;
         uint32 max_file_name_length = 12;
+        bool disable_chunk_deletion = 13;
+        bool worm = 14;
+        uint64 worm_grace_period_seconds = 15;
+        uint64 worm_retention_time_seconds = 16;
     }
     repeated PathConf locations = 2;
 }
@@ -452,8 +473,9 @@ message LockRequest {
 }
 message LockResponse {
     string renew_token = 1;
-    string moved_to = 2;
-    string error = 3;
+    string lock_owner = 2;
+    string lock_host_moved_to = 3;
+    string error = 4;
 }
 message UnlockRequest {
     string name = 1;

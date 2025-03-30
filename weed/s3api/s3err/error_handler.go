@@ -49,8 +49,7 @@ func WriteErrorResponse(w http.ResponseWriter, r *http.Request, errorCode ErrorC
 
 	apiError := GetAPIError(errorCode)
 	errorResponse := getRESTErrorResponse(apiError, r.URL.Path, bucket, object)
-	encodedErrorResponse := EncodeXMLResponse(errorResponse)
-	WriteResponse(w, r, apiError.HTTPStatusCode, encodedErrorResponse, MimeXML)
+	WriteXMLResponse(w, r, apiError.HTTPStatusCode, errorResponse)
 	PostLog(r, apiError.HTTPStatusCode, errorCode)
 }
 
@@ -79,6 +78,7 @@ func setCommonHeaders(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Accept-Ranges", "bytes")
 	if r.Header.Get("Origin") != "" {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Expose-Headers", "*")
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
 	}
 }

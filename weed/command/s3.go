@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
@@ -42,11 +43,13 @@ type S3Options struct {
 	portGrpc                  *int
 	config                    *string
 	domainName                *string
+	allowedOrigins            *string
 	tlsPrivateKey             *string
 	tlsCertificate            *string
 	tlsCACertificate          *string
 	tlsVerifyClientCert       *bool
 	metricsHttpPort           *int
+	metricsHttpIp             *string
 	allowEmptyFolder          *bool
 	allowDeleteBucketNotEmpty *bool
 	auditLogConfig            *string
@@ -64,6 +67,7 @@ func init() {
 	s3StandaloneOptions.portHttps = cmdS3.Flag.Int("port.https", 0, "s3 server https listen port")
 	s3StandaloneOptions.portGrpc = cmdS3.Flag.Int("port.grpc", 0, "s3 server grpc listen port")
 	s3StandaloneOptions.domainName = cmdS3.Flag.String("domainName", "", "suffix of the host name in comma separated list, {bucket}.{domainName}")
+	s3StandaloneOptions.allowedOrigins = cmdS3.Flag.String("allowedOrigins", "*", "comma separated list of allowed origins")
 	s3StandaloneOptions.dataCenter = cmdS3.Flag.String("dataCenter", "", "prefer to read and write to volumes in this data center")
 	s3StandaloneOptions.config = cmdS3.Flag.String("config", "", "path to the config file")
 	s3StandaloneOptions.auditLogConfig = cmdS3.Flag.String("auditLogConfig", "", "path to the audit log config file")
@@ -72,6 +76,7 @@ func init() {
 	s3StandaloneOptions.tlsCACertificate = cmdS3.Flag.String("cacert.file", "", "path to the TLS CA certificate file")
 	s3StandaloneOptions.tlsVerifyClientCert = cmdS3.Flag.Bool("tlsVerifyClientCert", false, "whether to verify the client's certificate")
 	s3StandaloneOptions.metricsHttpPort = cmdS3.Flag.Int("metricsPort", 0, "Prometheus metrics listen port")
+	s3StandaloneOptions.metricsHttpIp = cmdS3.Flag.String("metricsIp", "", "metrics listen ip. If empty, default to same as -ip.bind option.")
 	s3StandaloneOptions.allowEmptyFolder = cmdS3.Flag.Bool("allowEmptyFolder", true, "allow empty folders")
 	s3StandaloneOptions.allowDeleteBucketNotEmpty = cmdS3.Flag.Bool("allowDeleteBucketNotEmpty", true, "allow recursive deleting all entries along with bucket")
 	s3StandaloneOptions.localFilerSocket = cmdS3.Flag.String("localFilerSocket", "", "local filer socket path")
@@ -160,17 +165,26 @@ var cmdS3 = &Command{
 
 func runS3(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 
-	go stats_collect.StartMetricsServer(*s3StandaloneOptions.bindIp, *s3StandaloneOptions.metricsHttpPort)
+	switch {
+	case *s3StandaloneOptions.metricsHttpIp != "":
+		// noting to do, use s3StandaloneOptions.metricsHttpIp
+	case *s3StandaloneOptions.bindIp != "":
+		*s3StandaloneOptions.metricsHttpIp = *s3StandaloneOptions.bindIp
+	}
+	go stats_collect.StartMetricsServer(*s3StandaloneOptions.metricsHttpIp, *s3StandaloneOptions.metricsHttpPort)
 
 	return s3StandaloneOptions.startS3Server()
 
 }
 
 // GetCertificateWithUpdate Auto refreshing TSL certificate
-func (S3opt *S3Options) GetCertificateWithUpdate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-	certs, err := S3opt.certProvider.KeyMaterial(context.Background())
+func (s3opt *S3Options) GetCertificateWithUpdate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	certs, err := s3opt.certProvider.KeyMaterial(context.Background())
+	if certs == nil {
+		return nil, err
+	}
 	return &certs.Certs[0], err
 }
 
@@ -220,6 +234,7 @@ func (s3opt *S3Options) startS3Server() bool {
 		Port:                      *s3opt.port,
 		Config:                    *s3opt.config,
 		DomainName:                *s3opt.domainName,
+		AllowedOrigins:            strings.Split(*s3opt.allowedOrigins, ","),
 		BucketsPath:               filerBucketsPath,
 		GrpcDialOption:            grpcDialOption,
 		AllowEmptyFolder:          *s3opt.allowEmptyFolder,
@@ -297,7 +312,7 @@ func (s3opt *S3Options) startS3Server() bool {
 		}
 
 		caCertPool := x509.NewCertPool()
-		if *s3Options.tlsCACertificate != "" {
+		if *s3opt.tlsCACertificate != "" {
 			// load CA certificate file and add it to list of client CAs
 			caCertFile, err := ioutil.ReadFile(*s3opt.tlsCACertificate)
 			if err != nil {
@@ -307,7 +322,7 @@ func (s3opt *S3Options) startS3Server() bool {
 		}
 
 		clientAuth := tls.NoClientCert
-		if *s3Options.tlsVerifyClientCert {
+		if *s3opt.tlsVerifyClientCert {
 			clientAuth = tls.RequireAndVerifyClientCert
 		}
 
@@ -315,6 +330,10 @@ func (s3opt *S3Options) startS3Server() bool {
 			GetCertificate: s3opt.GetCertificateWithUpdate,
 			ClientAuth:     clientAuth,
 			ClientCAs:      caCertPool,
+		}
+		err = security.FixTlsConfig(util.GetViper(), httpS.TLSConfig)
+		if err != nil {
+			glog.Fatalf("error with tls config: %v", err)
 		}
 		if *s3opt.portHttps == 0 {
 			glog.V(0).Infof("Start Seaweed S3 API Server %s at https port %d", util.Version(), *s3opt.port)

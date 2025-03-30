@@ -3,12 +3,8 @@ package main
 import (
 	"embed"
 	"fmt"
-	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
-	"github.com/seaweedfs/seaweedfs/weed/util"
-	flag "github.com/seaweedfs/seaweedfs/weed/util/fla9"
 	"io"
 	"io/fs"
-	"math/rand"
 	"os"
 	"strings"
 	"sync"
@@ -17,8 +13,14 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	flag "github.com/seaweedfs/seaweedfs/weed/util/fla9"
+
+	"github.com/getsentry/sentry-go"
 	"github.com/seaweedfs/seaweedfs/weed/command"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 var IsDebug *bool
@@ -48,8 +50,19 @@ func init() {
 func main() {
 	glog.MaxSize = 1024 * 1024 * 10
 	glog.MaxFileCount = 5
-	rand.Seed(time.Now().UnixNano())
 	flag.Usage = usage
+
+	err := sentry.Init(sentry.ClientOptions{
+		SampleRate:       0.1,
+		EnableTracing:    true,
+		TracesSampleRate: 0.1,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sentry.Init: %v", err)
+	}
+	// Flush buffered events before the program terminates.
+	// Set the timeout to the maximum duration the program can afford to wait.
+	defer sentry.Flush(2 * time.Second)
 
 	if command.AutocompleteMain(commands) {
 		return
@@ -73,6 +86,7 @@ func main() {
 		return
 	}
 
+	util_http.InitGlobalHttpClient()
 	for _, cmd := range commands {
 		if cmd.Name() == args[0] && cmd.Run != nil {
 			cmd.Flag.Usage = func() { cmd.Usage() }
@@ -84,12 +98,15 @@ func main() {
 				cmd.Flag.Usage()
 				fmt.Fprintf(os.Stderr, "Default Parameters:\n")
 				cmd.Flag.PrintDefaults()
+				// Command execution failed - general error
+				setExitStatus(1)
 			}
 			exit()
 			return
 		}
 	}
 
+	// Unknown command - syntax error
 	fmt.Fprintf(os.Stderr, "weed: unknown subcommand %q\nRun 'weed help' for usage.\n", args[0])
 	setExitStatus(2)
 	exit()
@@ -141,19 +158,23 @@ func usage() {
 	printUsage(os.Stderr)
 	fmt.Fprintf(os.Stderr, "For Logging, use \"weed [logging_options] [command]\". The logging options are:\n")
 	flag.PrintDefaults()
-	os.Exit(2)
+	// Invalid command line usage - syntax error
+	setExitStatus(2)
+	exit()
 }
 
 // help implements the 'help' command.
 func help(args []string) {
 	if len(args) == 0 {
 		printUsage(os.Stdout)
-		// not exit 2: succeeded at 'weed help'.
+		// Success - help displayed correctly
 		return
 	}
 	if len(args) != 1 {
 		fmt.Fprintf(os.Stderr, "usage: weed help command\n\nToo many arguments given.\n")
-		os.Exit(2) // failed at 'weed help'
+		// Invalid help usage - syntax error
+		setExitStatus(2)
+		exit()
 	}
 
 	arg := args[0]
@@ -161,13 +182,15 @@ func help(args []string) {
 	for _, cmd := range commands {
 		if cmd.Name() == arg {
 			tmpl(os.Stdout, helpTemplate, cmd)
-			// not exit 2: succeeded at 'weed help cmd'.
+			// Success - help for specific command displayed correctly
 			return
 		}
 	}
 
 	fmt.Fprintf(os.Stderr, "Unknown help topic %#q.  Run 'weed help'.\n", arg)
-	os.Exit(2) // failed at 'weed help cmd'
+	// Unknown help topic - syntax error
+	setExitStatus(2)
+	exit()
 }
 
 var atexitFuncs []func()

@@ -44,6 +44,10 @@ func (c *commandRemoteMetaSync) Help() string {
 `
 }
 
+func (c *commandRemoteMetaSync) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandRemoteMetaSync) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	remoteMetaSyncCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -109,7 +113,7 @@ Right after "weed filer.remote.sync", the entry.RemoteEntry will be
 	remoteEntry.RemoteMtime = actual remote mtime, which should be a little greater than entry.Attributes.Mtime
 	remoteEntry.RemoteTag   = actual remote tag
 
-If entry does not exists, need to pull meta
+If entry does not exist, need to pull meta
 If entry.RemoteEntry == nil, this is a new local change and should not be overwritten
 
 	If entry.RemoteEntry.RemoteTag != remoteEntry.RemoteTag {

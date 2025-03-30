@@ -26,8 +26,8 @@ debug_server:
 	dlv --listen=:2345 --headless=true --api-version=2 --accept-multiclient exec ./weed -- server -dir=~/tmp/99 -filer -volume.port=8343 -s3 -volume.max=0 -master.volumeSizeLimitMB=1024 -volume.preStopSeconds=1
 
 debug_volume:
-	go build -gcflags="all=-N -l"
-	dlv --listen=:2345 --headless=true --api-version=2 --accept-multiclient exec ./weed -- volume -dir=~/tmp/100 -port 8564 -max=30 -preStopSeconds=2
+	go build -tags=5BytesOffset -gcflags="all=-N -l"
+	dlv --listen=:2345 --headless=true --api-version=2 --accept-multiclient exec ./weed -- volume -dir=/Users/chrislu/tmp/x/volume_data -port 8564 -max=1 -preStopSeconds=2
 
 debug_webdav:
 	go build -gcflags="all=-N -l"
@@ -40,6 +40,10 @@ debug_s3:
 debug_mq:
 	go build -gcflags="all=-N -l"
 	dlv --listen=:2345 --headless=true --api-version=2 --accept-multiclient exec ./weed -- -v=4 mq.broker
+
+debug_mq_agent:
+	go build -gcflags="all=-N -l"
+	dlv --listen=:2346 --headless=true --api-version=2 --accept-multiclient exec ./weed -- -v=4 mq.agent -broker=localhost:17777
 
 debug_filer_copy:
 	go build -gcflags="all=-N -l"

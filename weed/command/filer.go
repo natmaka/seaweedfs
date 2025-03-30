@@ -1,6 +1,9 @@
 package command
 
 import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
@@ -10,8 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"google.golang.org/grpc/reflection"
-
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -20,6 +21,10 @@ import (
 	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/spf13/viper"
+	"google.golang.org/grpc/credentials/tls/certprovider"
+	"google.golang.org/grpc/credentials/tls/certprovider/pemfile"
+	"google.golang.org/grpc/reflection"
 )
 
 var (
@@ -52,6 +57,7 @@ type FilerOptions struct {
 	disableHttp             *bool
 	cipher                  *bool
 	metricsHttpPort         *int
+	metricsHttpIp           *string
 	saveToFilerLimit        *int
 	defaultLevelDbDirectory *string
 	concurrentUploadLimitMB *int
@@ -61,6 +67,9 @@ type FilerOptions struct {
 	showUIDirectoryDelete   *bool
 	downloadMaxMBps         *int
 	diskType                *string
+	allowedOrigins          *string
+	exposeDirectoryData     *bool
+	certProvider            certprovider.Provider
 }
 
 func init() {
@@ -82,6 +91,7 @@ func init() {
 	f.disableHttp = cmdFiler.Flag.Bool("disableHttp", false, "disable http request, only gRpc operations are allowed")
 	f.cipher = cmdFiler.Flag.Bool("encryptVolumeData", false, "encrypt data on volume servers")
 	f.metricsHttpPort = cmdFiler.Flag.Int("metricsPort", 0, "Prometheus metrics listen port")
+	f.metricsHttpIp = cmdFiler.Flag.String("metricsIp", "", "metrics listen ip. If empty, default to same as -ip.bind option.")
 	f.saveToFilerLimit = cmdFiler.Flag.Int("saveToFilerLimit", 0, "files smaller than this limit will be saved in filer store")
 	f.defaultLevelDbDirectory = cmdFiler.Flag.String("defaultStoreDir", ".", "if filer.toml is empty, use an embedded filer store in the directory")
 	f.concurrentUploadLimitMB = cmdFiler.Flag.Int("concurrentUploadLimitMB", 128, "limit total concurrent upload size")
@@ -91,6 +101,8 @@ func init() {
 	f.showUIDirectoryDelete = cmdFiler.Flag.Bool("ui.deleteDir", true, "enable filer UI show delete directory button")
 	f.downloadMaxMBps = cmdFiler.Flag.Int("downloadMaxMBps", 0, "download max speed for each download request, in MB per second")
 	f.diskType = cmdFiler.Flag.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
+	f.allowedOrigins = cmdFiler.Flag.String("allowedOrigins", "*", "comma separated list of allowed origins")
+	f.exposeDirectoryData = cmdFiler.Flag.Bool("exposeDirectoryData", true, "whether to return directory metadata and content in Filer UI")
 
 	// start s3 on filer
 	filerStartS3 = cmdFiler.Flag.Bool("s3", false, "whether to start S3 gateway")
@@ -98,6 +110,7 @@ func init() {
 	filerS3Options.portHttps = cmdFiler.Flag.Int("s3.port.https", 0, "s3 server https listen port")
 	filerS3Options.portGrpc = cmdFiler.Flag.Int("s3.port.grpc", 0, "s3 server grpc listen port")
 	filerS3Options.domainName = cmdFiler.Flag.String("s3.domainName", "", "suffix of the host name in comma separated list, {bucket}.{domainName}")
+	filerS3Options.allowedOrigins = cmdFiler.Flag.String("s3.allowedOrigins", "*", "comma separated list of allowed origins")
 	filerS3Options.dataCenter = cmdFiler.Flag.String("s3.dataCenter", "", "prefer to read and write to volumes in this data center")
 	filerS3Options.tlsPrivateKey = cmdFiler.Flag.String("s3.key.file", "", "path to the TLS private key file")
 	filerS3Options.tlsCertificate = cmdFiler.Flag.String("s3.cert.file", "", "path to the TLS certificate file")
@@ -106,6 +119,8 @@ func init() {
 	filerS3Options.allowEmptyFolder = cmdFiler.Flag.Bool("s3.allowEmptyFolder", true, "allow empty folders")
 	filerS3Options.allowDeleteBucketNotEmpty = cmdFiler.Flag.Bool("s3.allowDeleteBucketNotEmpty", true, "allow recursive deleting all entries along with bucket")
 	filerS3Options.localSocket = cmdFiler.Flag.String("s3.localSocket", "", "default to /tmp/seaweedfs-s3-<port>.sock")
+	filerS3Options.tlsCACertificate = cmdFiler.Flag.String("s3.cacert.file", "", "path to the TLS CA certificate file")
+	filerS3Options.tlsVerifyClientCert = cmdFiler.Flag.Bool("s3.tlsVerifyClientCert", false, "whether to verify the client's certificate")
 
 	// start webdav on filer
 	filerStartWebDav = cmdFiler.Flag.Bool("webdav", false, "whether to start webdav gateway")
@@ -117,6 +132,7 @@ func init() {
 	filerWebDavOptions.tlsCertificate = cmdFiler.Flag.String("webdav.cert.file", "", "path to the TLS certificate file")
 	filerWebDavOptions.cacheDir = cmdFiler.Flag.String("webdav.cacheDir", os.TempDir(), "local cache directory for file chunks")
 	filerWebDavOptions.cacheSizeMB = cmdFiler.Flag.Int64("webdav.cacheCapacityMB", 0, "local cache capacity in MB")
+	filerWebDavOptions.maxMB = cmdFiler.Flag.Int("webdav.maxMB", 4, "split files larger than the limit")
 	filerWebDavOptions.filerRootPath = cmdFiler.Flag.String("webdav.filer.path", "/", "use this remote path from filer server")
 
 	// start iam on filer
@@ -165,9 +181,17 @@ func runFiler(cmd *Command, args []string) bool {
 		go http.ListenAndServe(fmt.Sprintf(":%d", *f.debugPort), nil)
 	}
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 
-	go stats_collect.StartMetricsServer(*f.bindIp, *f.metricsHttpPort)
+	switch {
+	case *f.metricsHttpIp != "":
+		// noting to do, use f.metricsHttpIp
+	case *f.bindIp != "":
+		*f.metricsHttpIp = *f.bindIp
+	case *f.ip != "":
+		*f.metricsHttpIp = *f.ip
+	}
+	go stats_collect.StartMetricsServer(*f.metricsHttpIp, *f.metricsHttpPort)
 
 	filerAddress := pb.NewServerAddress(*f.ip, *f.port, *f.portGrpc).String()
 	startDelay := time.Duration(2)
@@ -187,6 +211,7 @@ func runFiler(cmd *Command, args []string) bool {
 
 	if *filerStartWebDav {
 		filerWebDavOptions.filer = &filerAddress
+		filerWebDavOptions.ipBind = f.bindIp
 
 		if *filerWebDavOptions.disk == "" {
 			filerWebDavOptions.disk = f.diskType
@@ -215,6 +240,15 @@ func runFiler(cmd *Command, args []string) bool {
 	return true
 }
 
+// GetCertificateWithUpdate Auto refreshing TSL certificate
+func (fo *FilerOptions) GetCertificateWithUpdate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	certs, err := fo.certProvider.KeyMaterial(context.Background())
+	if certs == nil {
+		return nil, err
+	}
+	return &certs.Certs[0], err
+}
+
 func (fo *FilerOptions) startFiler() {
 
 	defaultMux := http.NewServeMux()
@@ -228,6 +262,9 @@ func (fo *FilerOptions) startFiler() {
 	}
 	if *fo.bindIp == "" {
 		*fo.bindIp = *fo.ip
+	}
+	if *fo.allowedOrigins == "" {
+		*fo.allowedOrigins = "*"
 	}
 
 	defaultLevelDbDirectory := util.ResolvePath(*fo.defaultLevelDbDirectory + "/filerldb2")
@@ -253,6 +290,7 @@ func (fo *FilerOptions) startFiler() {
 		ShowUIDirectoryDelete: *fo.showUIDirectoryDelete,
 		DownloadMaxBytesPs:    int64(*fo.downloadMaxMBps) * 1024 * 1024,
 		DiskType:              *fo.diskType,
+		AllowedOrigins:        strings.Split(*fo.allowedOrigins, ","),
 	})
 	if nfs_err != nil {
 		glog.Fatalf("Filer startup error: %v", nfs_err)
@@ -320,15 +358,62 @@ func (fo *FilerOptions) startFiler() {
 			httpS.Serve(filerSocketListener)
 		}()
 	}
-	if filerLocalListener != nil {
-		go func() {
-			if err := httpS.Serve(filerLocalListener); err != nil {
-				glog.Errorf("Filer Fail to serve: %v", e)
-			}
-		}()
-	}
-	if err := httpS.Serve(filerListener); err != nil {
-		glog.Fatalf("Filer Fail to serve: %v", e)
-	}
 
+	if viper.GetString("https.filer.key") != "" {
+		certFile := viper.GetString("https.filer.cert")
+		keyFile := viper.GetString("https.filer.key")
+		caCertFile := viper.GetString("https.filer.ca")
+		disbaleTlsVerifyClientCert := viper.GetBool("https.filer.disable_tls_verify_client_cert")
+
+		pemfileOptions := pemfile.Options{
+			CertFile:        certFile,
+			KeyFile:         keyFile,
+			RefreshDuration: security.CredRefreshingInterval,
+		}
+		if fo.certProvider, err = pemfile.NewProvider(pemfileOptions); err != nil {
+			glog.Fatalf("pemfile.NewProvider(%v) failed: %v", pemfileOptions, err)
+		}
+
+		caCertPool := x509.NewCertPool()
+		if caCertFile != "" {
+			caCertFile, err := os.ReadFile(caCertFile)
+			if err != nil {
+				glog.Fatalf("error reading CA certificate: %v", err)
+			}
+			caCertPool.AppendCertsFromPEM(caCertFile)
+		}
+
+		clientAuth := tls.NoClientCert
+		if !disbaleTlsVerifyClientCert {
+			clientAuth = tls.RequireAndVerifyClientCert
+		}
+
+		httpS.TLSConfig = &tls.Config{
+			GetCertificate: fo.GetCertificateWithUpdate,
+			ClientAuth:     clientAuth,
+			ClientCAs:      caCertPool,
+		}
+
+		if filerLocalListener != nil {
+			go func() {
+				if err := httpS.ServeTLS(filerLocalListener, "", ""); err != nil {
+					glog.Errorf("Filer Fail to serve: %v", e)
+				}
+			}()
+		}
+		if err := httpS.ServeTLS(filerListener, "", ""); err != nil {
+			glog.Fatalf("Filer Fail to serve: %v", e)
+		}
+	} else {
+		if filerLocalListener != nil {
+			go func() {
+				if err := httpS.Serve(filerLocalListener); err != nil {
+					glog.Errorf("Filer Fail to serve: %v", e)
+				}
+			}()
+		}
+		if err := httpS.Serve(filerListener); err != nil {
+			glog.Fatalf("Filer Fail to serve: %v", e)
+		}
+	}
 }

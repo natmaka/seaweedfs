@@ -9,6 +9,10 @@ metadata:
     helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/instance: {{ .Release.Name }}
+{{- if .Values.master.annotations }}
+  annotations:
+    {{- toYaml .Values.master.annotations | nindent 4 }}
+{{- end }}
 spec:
   serviceName: {{ template "seaweedfs.name" . }}-master
   podManagementPolicy: {{ .Values.master.podManagementPolicy }}
@@ -22,7 +26,6 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ template "seaweedfs.name" . }}
-      helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
       app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/component: master
   template:
@@ -35,8 +38,14 @@ spec:
       {{ with .Values.podLabels }}
       {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.master.podLabels }}
+      {{- toYaml . | nindent 8 }}
+      {{- end }}
       annotations:
       {{ with .Values.podAnnotations }}
+      {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.master.podAnnotations }}
       {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
@@ -44,6 +53,10 @@ spec:
       {{- if .Values.master.affinity }}
       affinity:
         {{ tpl .Values.master.affinity . | nindent 8 | trim }}
+      {{- end }}
+      {{- with .Values.master.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- if .Values.master.tolerations }}
       tolerations:
@@ -55,12 +68,15 @@ spec:
       priorityClassName: {{ .Values.master.priorityClassName | quote }}
       {{- end }}
       enableServiceLinks: false
-      {{- if .Values.master.serviceAccountName }}
-      serviceAccountName: {{ .Values.master.serviceAccountName | quote }}
+      {{- if .Values.global.createClusterRole }}
+      serviceAccountName: {{ .Values.master.serviceAccountName | default .Values.global.serviceAccountName | quote }} # for deleting statefulset pods after migration
       {{- end }}
       {{- if .Values.master.initContainers }}
       initContainers:
         {{ tpl .Values.master.initContainers . | nindent 8 | trim }}
+      {{- end }}
+      {{- if .Values.master.podSecurityContext.enabled }}
+      securityContext: {{- omit .Values.master.podSecurityContext "enabled" | toYaml | nindent 8 }}
       {{- end }}
       containers:
         - name: seaweedfs
@@ -84,21 +100,31 @@ spec:
             {{- if .Values.master.extraEnvironmentVars }}
             {{- range $key, $value := .Values.master.extraEnvironmentVars }}
             - name: {{ $key }}
+            {{- if kindIs "string" $value }}
               value: {{ $value | quote }}
+            {{- else }}
+              valueFrom:
+                {{ toYaml $value | nindent 16 | trim }}
+            {{- end -}}
             {{- end }}
             {{- end }}
             {{- if .Values.global.extraEnvironmentVars }}
             {{- range $key, $value := .Values.global.extraEnvironmentVars }}
             - name: {{ $key }}
+            {{- if kindIs "string" $value }}
               value: {{ $value | quote }}
+            {{- else }}
+              valueFrom:
+                {{ toYaml $value | nindent 16 | trim }}
+            {{- end -}}
             {{- end }}
             {{- end }}
           command:
             - "/bin/sh"
             - "-ec"
-            - | 
+            - |
               exec /usr/bin/weed \
-              {{- if eq .Values.master.logs.type "hostPath" }}
+              {{- if or (eq .Values.master.logs.type "hostPath") (eq .Values.master.logs.type "persistentVolumeClaim") (eq .Values.master.logs.type "emptyDir") }}
               -logdir=/logs \
               {{- else }}
               -logtostderr=true \
@@ -113,7 +139,7 @@ spec:
               -mdir=/data \
               -ip.bind={{ .Values.master.ipBind }} \
               {{- if .Values.global.enableReplication }}
-              -defaultReplication={{ .Values.global.replicationPlacment }} \
+              -defaultReplication={{ .Values.global.replicationPlacement }} \
               {{- else }}
               -defaultReplication={{ .Values.master.defaultReplication }} \
               {{- end }}
@@ -126,9 +152,10 @@ spec:
               {{- if .Values.master.metricsIntervalSec }}
               -metrics.intervalSeconds={{ .Values.master.metricsIntervalSec }} \
               {{- end }}
-              {{- else if .Values.master.metricsPort }}
-              -metricsPort={{ .Values.master.metricsPort }} \
               {{- end }}
+              {{- end }}
+              {{- if .Values.master.metricsPort }}
+              -metricsPort={{ .Values.master.metricsPort }} \
               {{- end }}
               -volumeSizeLimitMB={{ .Values.master.volumeSizeLimitMB }} \
               {{- if .Values.master.disableHttp }}
@@ -145,7 +172,7 @@ spec:
           volumeMounts:
             - name : data-{{ .Release.Namespace }}
               mountPath: /data
-            {{- if eq .Values.master.logs.type "hostPath" }}
+            {{- if or (eq .Values.master.logs.type "hostPath") (eq .Values.master.logs.type "persistentVolumeClaim") (eq .Values.master.logs.type "emptyDir") }}
             - name: seaweedfs-master-log-volume
               mountPath: "/logs/"
             {{- end }}
@@ -208,12 +235,16 @@ spec:
             failureThreshold: {{ .Values.master.livenessProbe.failureThreshold }}
             timeoutSeconds: {{ .Values.master.livenessProbe.timeoutSeconds }}
           {{- end }}
-          {{- if .Values.master.resources }}
+          {{- with .Values.master.resources }}
           resources:
-            {{ tpl .Values.master.resources . | nindent 12 | trim }}
+            {{- toYaml . | nindent 12 }}
           {{- end }}
-      {{- $hostpath_exists := include "master.hostpath_exists" . -}}
-      {{- if $hostpath_exists }}
+          {{- if .Values.master.containerSecurityContext.enabled }}
+          securityContext: {{- omit .Values.master.containerSecurityContext "enabled" | toYaml | nindent 12 }}
+          {{- end }}
+        {{- if .Values.master.sidecars }}
+        {{- include "common.tplvalues.render" (dict "value" .Values.master.sidecars "context" $) | nindent 8 }}
+        {{- end }}
       volumes:
         {{- if eq .Values.master.logs.type "hostPath" }}
         - name: seaweedfs-master-log-volume
@@ -221,11 +252,29 @@ spec:
             path: {{ .Values.master.logs.hostPathPrefix }}/logs/seaweedfs/master
             type: DirectoryOrCreate
         {{- end }}
+        {{- if eq .Values.master.logs.type "existingClaim" }}
+        - name: seaweedfs-master-log-volume
+          persistentVolumeClaim:
+            claimName: {{ .Values.master.logs.claimName }}
+        {{- end }}
+        {{- if eq .Values.master.logs.type "emptyDir" }}
+        - name: seaweedfs-master-log-volume
+          emptyDir: {}
+        {{- end }}
         {{- if eq .Values.master.data.type "hostPath" }}
         - name: data-{{ .Release.Namespace }}
           hostPath:
             path: {{ .Values.master.data.hostPathPrefix }}/seaweed-master/
             type: DirectoryOrCreate
+        {{- end }}
+        {{- if eq .Values.master.data.type "existingClaim" }}
+        - name: data-{{ .Release.Namespace }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.master.data.claimName }}
+        {{- end }}
+        {{- if eq .Values.master.data.type "emptyDir" }}
+        - name: data-{{ .Release.Namespace }}
+          emptyDir: {}
         {{- end }}
         - name: master-config
           configMap:
@@ -251,7 +300,6 @@ spec:
             secretName: {{ template "seaweedfs.name" . }}-client-cert
         {{- end }}
         {{ tpl .Values.master.extraVolumes . | indent 8 | trim }}
-      {{- end }}
       {{- if .Values.master.nodeSelector }}
       nodeSelector:
         {{ tpl .Values.master.nodeSelector . | indent 8 | trim }}
@@ -262,6 +310,10 @@ spec:
     {{- if eq .Values.master.data.type "persistentVolumeClaim"}}
     - metadata:
         name: data-{{ .Release.Namespace }}
+        {{- with .Values.master.data.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
       spec:
         accessModes: [ "ReadWriteOnce" ]
         storageClassName: {{ .Values.master.data.storageClass }}
@@ -272,6 +324,10 @@ spec:
     {{- if eq .Values.master.logs.type "persistentVolumeClaim"}}
     - metadata:
         name: seaweedfs-master-log-volume
+        {{- with .Values.master.logs.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
       spec:
         accessModes: [ "ReadWriteOnce" ]
         storageClassName: {{ .Values.master.logs.storageClass }}

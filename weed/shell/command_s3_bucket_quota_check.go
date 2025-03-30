@@ -29,6 +29,10 @@ func (c *commandS3BucketQuotaEnforce) Help() string {
 `
 }
 
+func (c *commandS3BucketQuotaEnforce) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	bucketCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -130,7 +134,7 @@ func (c *commandS3BucketQuotaEnforce) processEachBucket(fc *filer.FilerConf, fil
 		} else {
 			fmt.Fprintf(writer, "    changing bucket %s to writable.\n", entry.Name)
 		}
-		fc.AddLocationConf(locConf)
+		fc.SetLocationConf(locConf)
 	}
 
 	return

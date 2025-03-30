@@ -84,8 +84,6 @@ func (fs *FilerServer) Ping(ctx context.Context, req *filer_pb.PingRequest) (res
 
 func (fs *FilerServer) GetFilerConfiguration(ctx context.Context, req *filer_pb.GetFilerConfigurationRequest) (resp *filer_pb.GetFilerConfigurationResponse, err error) {
 
-	clusterId, _ := fs.filer.Store.KvGet(context.Background(), []byte("clusterId"))
-
 	t := &filer_pb.GetFilerConfigurationResponse{
 		Masters:            fs.option.Masters.GetInstancesAsStrings(),
 		Collection:         fs.option.Collection,
@@ -97,8 +95,9 @@ func (fs *FilerServer) GetFilerConfiguration(ctx context.Context, req *filer_pb.
 		MetricsAddress:     fs.metricsAddress,
 		MetricsIntervalSec: int32(fs.metricsIntervalSec),
 		Version:            util.Version(),
-		ClusterId:          string(clusterId),
 		FilerGroup:         fs.option.FilerGroup,
+		MajorVersion:       util.MAJOR_VERSION,
+		MinorVersion:       util.MINOR_VERSION,
 	}
 
 	glog.V(4).Infof("GetFilerConfiguration: %v", t)
